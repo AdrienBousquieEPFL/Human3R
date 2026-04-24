@@ -357,7 +357,7 @@ class SceneHumanViewer:
         camera_downsample_factor=1,
     ):
         self.size=size
-        self.server = viser.ViserServer(port=port)
+        self.server = viser.ViserServer(host="0.0.0.0", port=port)
         self.server.set_up_direction("-y")
         self.device = device
         self.conf_list = conf_list
