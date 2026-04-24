@@ -4,10 +4,10 @@ We provide multiple checkpoints with different Multi-HMR encoders on [HuggingFac
 Once downloaded you need to place them into the `src` directory.
 ```Bash
 # Download multiple Human3R checkpoints
-huggingface-cli download faneggg/human3r human3r_672S.pth --local-dir ./src
-huggingface-cli download faneggg/human3r human3r_672B.pth --local-dir ./src
-huggingface-cli download faneggg/human3r human3r_672L.pth --local-dir ./src
-huggingface-cli download faneggg/human3r human3r_896L.pth --local-dir ./src
+hf download faneggg/human3r human3r_672S.pth --local-dir ./src
+hf download faneggg/human3r human3r_672B.pth --local-dir ./src
+hf download faneggg/human3r human3r_672L.pth --local-dir ./src
+hf download faneggg/human3r human3r_896L.pth --local-dir ./src
 ```
 
 
