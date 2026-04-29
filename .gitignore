@@ -62,3 +62,6 @@ command
 *.pkl
 *.npy
 *.npz
+
+# Jetbrains
+.idea/
