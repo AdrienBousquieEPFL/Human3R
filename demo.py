@@ -87,6 +87,28 @@ def parse_args():
         help="Save output results.",
     )
     parser.add_argument(
+        "--save_scene",
+        action="store_true",
+        help="Save a single scene.pkl with everything the viewer needs, so replay.py can launch the viewer later without re-running inference.",
+    )
+    parser.add_argument(
+        "--eval_penetration",
+        action="store_true",
+        help="Compute the human-scene penetration metric (A1) on inference outputs and print the summary.",
+    )
+    parser.add_argument(
+        "--pen_tolerance_mm",
+        type=float,
+        default=5.0,
+        help="Penetration tolerance in mm (depths below this are ignored as surface noise).",
+    )
+    parser.add_argument(
+        "--pen_csv",
+        type=str,
+        default=None,
+        help="Optional path to save per-frame penetration metrics as CSV.",
+    )
+    parser.add_argument(
         "--render",
         action="store_true",
         help="Save smpl mesh projection.",
@@ -651,6 +673,40 @@ def run_inference(args):
     conf_to_vis = [c.cpu().numpy() for c in conf]
     edge_colors = [None] * len(pts3ds_to_vis)
     verts_to_vis = [p.cpu().numpy() for p in all_smpl_verts]
+
+    if args.eval_penetration:
+        from eval_penetration import evaluate_sequence, print_summary, save_per_frame_csv
+        per_frame, summary = evaluate_sequence(
+            pts3ds=pts3ds_to_vis,
+            verts_list=verts_to_vis,
+            cam_dict=cam_dict,
+            msks=msks_to_vis,
+            conf_list=conf_to_vis,
+            tolerance_mm=args.pen_tolerance_mm,
+        )
+        print_summary(summary)
+        if args.pen_csv:
+            save_per_frame_csv(per_frame, args.pen_csv)
+            print(f"  Per-frame CSV:              {args.pen_csv}")
+
+    if args.save_scene:
+        import pickle
+        os.makedirs(args.output_dir, exist_ok=True)
+        scene_path = os.path.join(args.output_dir, "scene.pkl")
+        scene_bundle = {
+            "pts3ds": pts3ds_to_vis,
+            "colors": colors_to_vis,
+            "conf": conf_to_vis,
+            "cam_dict": cam_dict,
+            "verts": verts_to_vis,
+            "smpl_faces": smpl_faces,
+            "smpl_id": [t.cpu().numpy() for t in smpl_id],
+            "msks": msks_to_vis,
+            "size": args.size,
+        }
+        with open(scene_path, "wb") as f:
+            pickle.dump(scene_bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Scene bundle saved to {scene_path}")
 
     # Create and run the point cloud viewer.
     print("Launching Human3R viewer...")
