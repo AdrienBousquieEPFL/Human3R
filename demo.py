@@ -597,6 +597,19 @@ def run_inference(args):
         print("CUDA not available. Switching to CPU.")
         device = "cpu"
 
+    if device == "cuda":
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        total_gib = props.total_memory / (1024 ** 3)
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        print(
+            f"[device] Using CUDA: {props.name} (cuda:{idx}, {total_gib:.1f} GiB), "
+            f"CUDA_VISIBLE_DEVICES={cvd}, torch={torch.__version__}, "
+            f"cuda_runtime={torch.version.cuda}"
+        )
+    else:
+        print(f"[device] Using CPU (torch={torch.__version__})")
+
     # Add the checkpoint path (required for model imports in the dust3r package).
     add_path_to_dust3r(args.model_path)
 
@@ -605,26 +618,35 @@ def run_inference(args):
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import SceneHumanViewer
 
+    timings = {}
+
     # Prepare image file paths.
+    t0 = time.time()
     img_paths, tmpdirname = parse_seq_path(args.seq_path)
+    timings["load_frames"] = time.time() - t0
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
-    
+
+    t0 = time.time()
     if args.max_frames is not None:
         img_paths = img_paths[:args.max_frames]
     img_paths = img_paths[::args.subsample]
+    timings["prepare_image_paths"] = time.time() - t0
 
     print(f"Found {len(img_paths)} images in {args.seq_path}.")
     img_mask = [True] * len(img_paths)
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
+    t0 = time.time()
     model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
     model.eval()
+    timings["load_model"] = time.time() - t0
 
     # Prepare input views.
     print("Preparing input views...")
+    t0 = time.time()
     img_res = getattr(model, 'mhmr_img_res', None)
     views = prepare_input(
         img_paths=img_paths,
@@ -635,6 +657,7 @@ def run_inference(args):
         img_res=img_res,
         reset_interval=args.reset_interval
     )
+    timings["prepare_input_views"] = time.time() - t0
 
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -645,6 +668,7 @@ def run_inference(args):
     outputs, _ = inference_recurrent_lighter(
         views, model, device, use_ttt3r=args.use_ttt3r)
     total_time = time.time() - start_time
+    timings["run_inference"] = total_time
     per_frame_time = total_time / len(views)
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
@@ -652,6 +676,7 @@ def run_inference(args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
+    t0 = time.time()
     (
         pts3ds_other, 
         colors, 
@@ -673,6 +698,7 @@ def run_inference(args):
     conf_to_vis = [c.cpu().numpy() for c in conf]
     edge_colors = [None] * len(pts3ds_to_vis)
     verts_to_vis = [p.cpu().numpy() for p in all_smpl_verts]
+    timings["process_outputs"] = time.time() - t0
 
     if args.eval_penetration:
         from eval_penetration import evaluate_sequence, print_summary, save_per_frame_csv
@@ -710,6 +736,7 @@ def run_inference(args):
 
     # Create and run the point cloud viewer.
     print("Launching Human3R viewer...")
+    t0 = time.time()
     viewer = SceneHumanViewer(
         pts3ds_to_vis,
         colors_to_vis,
@@ -730,6 +757,13 @@ def run_inference(args):
         smpl_downsample_factor=args.smpl_downsample,
         camera_downsample_factor=args.camera_downsample
     )
+    timings["create_viewer_and_run"] = time.time() - t0
+
+    print("\n===== Runtime report =====")
+    for name, t in timings.items():
+        print(f"  {name:25s} {t:8.2f} s")
+    print("==========================")
+
     viewer.run()
 
 
@@ -742,7 +776,6 @@ def main():
         return
     else:
         run_inference(args)
-
 
 if __name__ == "__main__":
     main()
