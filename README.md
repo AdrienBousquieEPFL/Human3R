@@ -39,13 +39,28 @@ cd Human3R
 ```bash
 conda create -n human3r python=3.11 cmake
 conda activate human3r
-conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia  # use the correct version of cuda for your system
+
+# PyTorch — pick the build that matches your GPU.
+# Most setups (CUDA 12.4):
+conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
+# Blackwell GPUs (RTX 5060/5070/5080/5090) need CUDA 12.8 + nightly torch instead:
+# pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
 pip install -r requirements.txt
 # issues with pytorch dataloader, see https://github.com/pytorch/pytorch/issues/99625
 conda install 'llvm-openmp<16'
-# for training logging
+# compilers + ninja for building the cuda kernels below (gsplat, pytorch3d, RoPE)
 conda install -y gcc_linux-64 gxx_linux-64
+pip install ninja
+
 pip install git+https://github.com/nerfstudio-project/gsplat.git
+
+# VolumetricSMPL + pytorch3d (used by demo.py for the volumetric body model / penetration eval).
+# pytorch3d has no prebuilt wheels for recent torch/CUDA combos, so build from source:
+pip install fvcore iopath
+pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@main"
+pip install VolumetricSMPL
+
 # for evaluation
 pip install evo
 pip install open3d

@@ -26,6 +26,10 @@ import argparse
 import tempfile
 import shutil
 from copy import deepcopy
+
+from VolumetricSMPL import attach_volume
+from types import SimpleNamespace
+
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
 import roma
@@ -165,6 +169,12 @@ def parse_args():
         default=10,
         help="Mask morphology for the viewer",
     )
+    parser.add_argument(
+        "--only_penetration",
+        action="store_true",
+        help="In the viewer, show only scene points that lie inside an SMPL volume "
+             "(by zeroing the confidence of all other points so vis_threshold filters them out).",
+    )
     return parser.parse_args()
 
 
@@ -300,8 +310,9 @@ def prepare_input(
     return views
 
 def prepare_output(
-        outputs, outdir, revisit=1, use_pose=True, 
-        save=False, render=False, render_video=False, img_res=None, subsample=1):
+        outputs, outdir, revisit=1, use_pose=True,
+        save=False, render=False, render_video=False, img_res=None, subsample=1,
+        device='cuda'):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -436,12 +447,28 @@ def prepare_output(
         msks = [torch.zeros(1, H, W) for _ in range(B)]
 
     # SMPL layer
-    smpl_layer = SMPL_Layer(type='smplx', 
-                            gender='neutral', 
-                            num_betas=smpl_shape[0].shape[-1], 
-                            kid=False, 
+    smpl_layer = SMPL_Layer(type='smplx',
+                            gender='neutral',
+                            num_betas=smpl_shape[0].shape[-1],
+                            kid=False,
                             person_center='head')
     smpl_faces = smpl_layer.bm_x.faces
+    attach_volume(smpl_layer.bm_x, pretrained=True, device=device)
+    vol_device = next(smpl_layer.bm_x.volume.parameters()).device
+    smpl_layer.to(vol_device)
+
+    # Pre-move every tensor consumed by the per-frame volume query so we don't pay a host->device
+    # transfer on each iteration. CPU originals are still referenced below for numpy / viewer code.
+    intrinsics_dev = intrinsics_tosave.to(vol_device)
+    pts3ds_other_dev = pts3ds_other_tosave.to(vol_device)
+    pr_poses_dev = [p.to(vol_device) for p in pr_poses]
+    msks_dev = [m.to(vol_device) for m in msks]
+    smpl_rotvec_dev = [t.to(vol_device) for t in smpl_rotvec]
+    smpl_shape_dev = [t.to(vol_device) for t in smpl_shape]
+    smpl_transl_dev = [t.to(vol_device) for t in smpl_transl]
+    smpl_expression_dev = [
+        t.to(vol_device) if t is not None else None for t in smpl_expression
+    ]
 
     if save:
         print(f"Saving output to {outdir}...")
@@ -452,18 +479,19 @@ def prepare_output(
         os.makedirs(os.path.join(outdir, "smpl"), exist_ok=True)
 
     all_verts = []
+    inside_masks = []  # per-frame [H, W] bool: scene points (non-human) inside any SMPL volume
     for f_id in range(B):
         n_humans_i = smpl_shape[f_id].shape[0]
         
         if n_humans_i > 0:
             with torch.no_grad():
                 smpl_out = smpl_layer(
-                    smpl_rotvec[f_id], 
-                    smpl_shape[f_id], 
-                    smpl_transl[f_id], 
-                    None, None, 
-                    K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
-                    expression=smpl_expression[f_id])
+                    smpl_rotvec_dev[f_id],
+                    smpl_shape_dev[f_id],
+                    smpl_transl_dev[f_id],
+                    None, None,
+                    K=intrinsics_dev[f_id].expand(n_humans_i, -1, -1),
+                    expression=smpl_expression_dev[f_id])
         
         depth = depths_tosave[f_id].numpy()
         conf = conf_self_tosave[f_id].numpy()
@@ -472,14 +500,49 @@ def prepare_output(
         intrins = intrinsics_tosave[f_id].numpy()
 
         if n_humans_i > 0:
+            # CPU copies for downstream (numpy / viewer / geotrf with CPU pr_poses)
+            smpl_v3d_cpu = smpl_out['smpl_v3d'].cpu()
             # transform smpl verts to world coordinates
-            all_verts.append(geotrf(pr_poses[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0])
-            pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
+            all_verts.append(geotrf(pr_poses[f_id], smpl_v3d_cpu.unsqueeze(0))[0])
+            pr_verts = [t.numpy() for t in smpl_v3d_cpu.unbind(0)]
             pr_faces = [smpl_faces] * n_humans_i
+
+            # World-space penetration query: which scene points lie inside any SMPL volume?
+            verts_world_dev = geotrf(pr_poses_dev[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0]
+            joints_world_dev = geotrf(pr_poses_dev[f_id], smpl_out['smpl_j3d'].unsqueeze(0))[0]
+            points_world_dev = pts3ds_other_dev[f_id].reshape(-1, 3)
+            # expand() gives a zero-stride view across humans. The volume's internal F.pad
+            # allocates a fresh contiguous tensor anyway, so .contiguous() here would only
+            # double-allocate without saving downstream work.
+            points_world_b = points_world_dev.unsqueeze(0).expand(n_humans_i, -1, -1)
+            smpl_volume_state = SimpleNamespace(
+                full_pose=smpl_rotvec_dev[f_id].reshape(n_humans_i, -1),
+                joints=joints_world_dev,
+                vertices=verts_world_dev,
+            )
+            with torch.no_grad():
+                smpl_layer.bm_x.volume.detach_cache()
+                sdf = smpl_layer.bm_x.volume.query(points_world_b, smpl_volume_state)
+            inside = (sdf < 0).any(dim=0)  # [H*W] — true if any body's SDF says inside
+            human_mask = msks_dev[f_id].reshape(-1) > 0.5  # pixels labeled as human
+            scene_mask = ~human_mask
+            n_total = inside.numel()
+            n_inside_total = int(inside.sum().item())
+            n_inside_scene = int((inside & scene_mask).sum().item())
+            n_scene = int(scene_mask.sum().item())
+            print(
+                f"[VolumetricSMPL] Frame {f_id:06d}: "
+                f"scene-only {n_inside_scene}/{n_scene} inside, "
+                f"all {n_inside_total}/{n_total} inside, "
+                f"sdf min/med/max={sdf.min().item():.3f}/{sdf.median().item():.3f}/{sdf.max().item():.3f}"
+            )
+            inside_masks.append((inside & scene_mask).reshape(H, W).cpu())
         else:
             pr_verts = []
             pr_faces = []
             all_verts.append(torch.empty(0))
+            inside_masks.append(torch.zeros(H, W, dtype=torch.bool))
+            print(f"[VolumetricSMPL] Frame {f_id:06d}: no humans detected")
 
         if render:
             hm = vis_heatmap(colors_tosave[f_id], smpl_scores[f_id]).numpy()
@@ -543,13 +606,14 @@ def prepare_output(
     
     return (
         pts3ds_other,
-        colors, 
-        conf_other, 
-        cam_dict, 
-        all_verts, 
+        colors,
+        conf_other,
+        cam_dict,
+        all_verts,
         smpl_faces,
         smpl_id,
-        msks
+        msks,
+        inside_masks,
     )
 
 def parse_seq_path(p):
@@ -679,16 +743,18 @@ def run_inference(args):
     t0 = time.time()
     (
         pts3ds_other, 
-        colors, 
-        conf, 
-        cam_dict, 
-        all_smpl_verts, 
+        colors,
+        conf,
+        cam_dict,
+        all_smpl_verts,
         smpl_faces,
         smpl_id,
         msks,
+        inside_masks,
         ) = prepare_output(
-        outputs, args.output_dir, 1, True, 
-        args.save, args.render, args.render_video, img_res, args.subsample
+        outputs, args.output_dir, 1, True,
+        args.save, args.render, args.render_video, img_res, args.subsample,
+        device=device,
     )
 
     # Convert tensors to numpy arrays for visualization.
@@ -698,9 +764,17 @@ def run_inference(args):
     conf_to_vis = [c.cpu().numpy() for c in conf]
     edge_colors = [None] * len(pts3ds_to_vis)
     verts_to_vis = [p.cpu().numpy() for p in all_smpl_verts]
+    inside_masks_np = [m.cpu().numpy() for m in inside_masks]  # [H, W] bool per frame
     timings["process_outputs"] = time.time() - t0
 
-    if args.eval_penetration:
+    if args.only_penetration:
+        # conf_to_vis[i]: [1, H, W] — drop conf below any sane vis_threshold for non-inside points
+        for i, m in enumerate(inside_masks_np):
+            conf_to_vis[i][0][~m] = 0.0
+        n_total_inside = sum(int(m.sum()) for m in inside_masks_np)
+        print(f"[VolumetricSMPL] Showing only {n_total_inside} penetrating scene points across {len(inside_masks_np)} frames.")
+
+    if args.eval_penetration: # TODO: Delete this penetration cause its the depth one
         from eval_penetration import evaluate_sequence, print_summary, save_per_frame_csv
         per_frame, summary = evaluate_sequence(
             pts3ds=pts3ds_to_vis,
@@ -758,6 +832,17 @@ def run_inference(args):
         camera_downsample_factor=args.camera_downsample
     )
     timings["create_viewer_and_run"] = time.time() - t0
+
+    if args.only_penetration:
+        # Bump default point size so the sparse penetrating points are visible.
+        viewer.psize_slider.value = 0.02
+        # The viewer's default fg/bg filter (using the dilated human silhouette) hides anything
+        # inside the human silhouette in image space — but that's exactly where penetrating points
+        # project. Enable both checkboxes so display_mask becomes all-True and only the conf
+        # threshold gates visibility.
+        viewer.gui_show_foreground.value = True
+        viewer.gui_show_background.value = True
+        viewer.gui_show_smpl.value = False
 
     print("\n===== Runtime report =====")
     for name, t in timings.items():
