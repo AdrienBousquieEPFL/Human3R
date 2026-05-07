@@ -161,21 +161,26 @@ def inference_recurrent(groups, model, device, verbose=True):
     return result, state_args
 
 @torch.no_grad()
-def inference_recurrent_lighter(groups, model, device, verbose=True, is_naive=False, use_ttt3r=False):
+def inference_recurrent_lighter(
+    groups, model, device, verbose=True, is_naive=False, use_ttt3r=False,
+    init_state_args=None, init_trackers=None,
+):
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")
 
     with torch.cuda.amp.autocast(enabled=False):
         if is_naive:
             preds, batch, state_args = model.forward_recurrent_lighter_naive(
-            groups, device, ret_state=True, use_ttt3r=use_ttt3r
-        )
-        else:
-            preds, batch, state_args = model.forward_recurrent_lighter(
                 groups, device, ret_state=True, use_ttt3r=use_ttt3r
             )
+            trackers = None
+        else:
+            preds, batch, state_args, trackers = model.forward_recurrent_lighter(
+                groups, device, ret_state=True, use_ttt3r=use_ttt3r,
+                init_state_args=init_state_args, init_trackers=init_trackers,
+            )
         res = dict(views=batch, pred=preds)
-    return res, state_args
+    return res, state_args, trackers
 
 def check_if_same_size(pairs):
     shapes1 = [img1["img"].shape[-2:] for img1, img2 in pairs]

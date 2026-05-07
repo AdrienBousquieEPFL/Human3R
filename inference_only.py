@@ -314,7 +314,7 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, _ = inference_recurrent_lighter(
+    outputs, _, _ = inference_recurrent_lighter(
         views, model, device, use_ttt3r=args.use_ttt3r)
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)

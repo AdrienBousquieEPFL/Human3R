@@ -126,7 +126,7 @@ def run_inference(
     for i, view in enumerate(views):
         views[i] = {key: view[key] for key in keep_keys if key in view}
 
-    outputs, _ = inference_recurrent_lighter(
+    outputs, _, _ = inference_recurrent_lighter(
         views, model, device, verbose=False, is_naive=args.is_naive, use_ttt3r=args.use_ttt3r)
 
     pred = prepare_output(
