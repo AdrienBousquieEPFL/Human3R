@@ -8,7 +8,7 @@ from eval.global_human.data_utils import *
 
 def create_emdb(split):
     return {
-        "img_path": "/path/to/EMDB",
+        "img_path": "/work/courses/digital_human/team8/EMDB_dataset",
         "dir_path_func": lambda img_path, seq: os.path.join(f"{img_path}/{seq}/images"),
         "seq_list": None,
         "full_seq": True,
