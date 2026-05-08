@@ -159,139 +159,82 @@ def parse_args():
         default=10,
         help="Mask morphology for the viewer",
     )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=32,
+        help="Frames processed per inference chunk. Bounds peak input/output RAM.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader workers for input frame decoding. 0 keeps everything in main process.",
+    )
     return parser.parse_args()
 
 
-def prepare_input(
-    img_paths, 
-    img_mask, 
-    size, 
-    raymaps=None, 
-    raymap_mask=None, 
-    revisit=1, 
-    update=True, 
-    img_res=None, 
-    reset_interval=100
-):
+class FrameDataset(torch.utils.data.Dataset):
+    """Lazily produces one view dict per frame for the demo's streaming pipeline.
+
+    Mirrors the no-raymap branch of the previous prepare_input but drops the
+    [1, 6, H, W] NaN ray_map placeholder, which is unused on the lighter
+    inference path (forward_step / _recurrent_rollout never read it).
     """
-    Prepare input views for inference from a list of image paths.
 
-    Args:
-        img_paths (list): List of image file paths.
-        img_mask (list of bool): Flags indicating valid images.
-        size (int): Target image size.
-        raymaps (list, optional): List of ray maps.
-        raymap_mask (list, optional): Flags indicating valid ray maps.
-        revisit (int): How many times to revisit each view.
-        update (bool): Whether to update the state on revisits.
+    def __init__(self, img_paths, size, img_res=None, reset_interval=10000000):
+        self.img_paths = list(img_paths)
+        self.size = size
+        self.img_res = img_res
+        self.reset_interval = reset_interval
+        self._K_mhmr = None
+        if img_res is not None:
+            from dust3r.utils.geometry import get_camera_parameters
+            self._K_mhmr = get_camera_parameters(img_res, device="cpu")
 
-    Returns:
-        list: A list of view dictionaries.
-    """
-    # Import image loader (delayed import needed after adding ckpt path).
-    from src.dust3r.utils.image import load_images, pad_image
-    from dust3r.utils.geometry import get_camera_parameters
+    def __len__(self):
+        return len(self.img_paths)
 
-    images = load_images(img_paths, size=size)
-    if img_res is not None:
-        K_mhmr = get_camera_parameters(img_res, device="cpu") # if use pseudo K
+    def __getitem__(self, i):
+        from src.dust3r.utils.image import load_images, pad_image
+        img_dict = load_images([self.img_paths[i]], size=self.size, verbose=False)[0]
+        view = {
+            "img": img_dict["img"],
+            "true_shape": torch.from_numpy(img_dict["true_shape"]),
+            "idx": i,
+            "instance": str(i),
+            "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(0),
+            "img_mask": torch.tensor(True).unsqueeze(0),
+            "ray_mask": torch.tensor(False).unsqueeze(0),
+            "update": torch.tensor(True).unsqueeze(0),
+            "reset": torch.tensor((i + 1) % self.reset_interval == 0).unsqueeze(0),
+        }
+        if self.img_res is not None:
+            view["img_mhmr"] = pad_image(view["img"], self.img_res)
+            view["K_mhmr"] = self._K_mhmr
+        return view
 
-    views = []
-    if raymaps is None and raymap_mask is None:
-        # Only images are provided.
-        for i in range(len(images)):
-            view = {
-                "img": images[i]["img"],
-                "ray_map": torch.full(
-                    (
-                        images[i]["img"].shape[0],
-                        6,
-                        images[i]["img"].shape[-2],
-                        images[i]["img"].shape[-1],
-                    ),
-                    torch.nan,
-                ),
-                "true_shape": torch.from_numpy(images[i]["true_shape"]),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(
-                    np.eye(4, dtype=np.float32)
-                    ).unsqueeze(0),
-                "img_mask": torch.tensor(True).unsqueeze(0),
-                "ray_mask": torch.tensor(False).unsqueeze(0),
-                "update": torch.tensor(True).unsqueeze(0),
-                "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-            }
-            if img_res is not None:
-                view["img_mhmr"] = pad_image(view["img"], img_res)
-                view["K_mhmr"] = K_mhmr
-            views.append(view)
-            if (i+1) % reset_interval == 0:
-                overlap_view = deepcopy(view)
-                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                views.append(overlap_view)
-    else:
-        # Combine images and raymaps.
-        num_views = len(images) + len(raymaps)
-        assert len(img_mask) == len(raymap_mask) == num_views
-        assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
 
-        j = 0
-        k = 0
-        for i in range(num_views):
-            view = {
-                "img": (
-                    images[j]["img"]
-                    if img_mask[i]
-                    else torch.full_like(images[0]["img"], torch.nan)
-                ),
-                "ray_map": (
-                    raymaps[k]
-                    if raymap_mask[i]
-                    else torch.full_like(raymaps[0], torch.nan)
-                ),
-                "true_shape": (
-                    torch.from_numpy(images[j]["true_shape"])
-                    if img_mask[i]
-                    else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]]))
-                ),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(
-                    np.eye(4, dtype=np.float32)
-                    ).unsqueeze(0),
-                "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
-                "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
-                "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-            }
-            if img_res is not None:
-                view["img_mhmr"] = pad_image(view["img"], img_res)
-                view["K_mhmr"] = K_mhmr
-            if img_mask[i]:
-                j += 1
-            if raymap_mask[i]:
-                k += 1
-            views.append(view)
-            if (i+1) % reset_interval == 0:
-                overlap_view = deepcopy(view)
-                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                views.append(overlap_view)
-        assert j == len(images) and k == len(raymaps)
+def _frame_iter_from_loader(loader):
+    """Yields each loaded view, then yields a deepcopy overlap-view (reset=False)
+    immediately after any view whose reset==True. Reproduces the overlap-view
+    side effect of the old prepare_input loop."""
+    for view in loader:
+        yield view
+        if bool(view["reset"].item()):
+            overlap = deepcopy(view)
+            overlap["reset"] = torch.tensor(False).unsqueeze(0)
+            yield overlap
 
-    if revisit > 1:
-        new_views = []
-        for r in range(revisit):
-            for i, view in enumerate(views):
-                new_view = deepcopy(view)
-                new_view["idx"] = r * len(views) + i
-                new_view["instance"] = str(r * len(views) + i)
-                if r > 0 and not update:
-                    new_view["update"] = torch.tensor(False).unsqueeze(0)
-                new_views.append(new_view)
-        return new_views
 
-    return views
+def _strip_view_for_output(view):
+    """The accumulated outputs["views"] list is only read for `img` (used to
+    build colors) and `reset` (used to drop overlap-views). Keeping the rest
+    in the accumulator wastes ~8 MB/frame at size=512."""
+    return {
+        "img": view["img"].detach().cpu(),
+        "reset": view["reset"].detach().cpu(),
+    }
 
 def prepare_output(
         outputs, outdir, revisit=1, use_pose=True,
@@ -673,8 +616,8 @@ def run_inference(args):
     # Add the checkpoint path (required for model imports in the dust3r package).
     add_path_to_dust3r(args.model_path)
 
-    # Import model and inference functions after adding the ckpt path.
-    from src.dust3r.inference import inference_recurrent_lighter
+    # Import model after adding the ckpt path. Streaming inference drives
+    # model.forward_step directly, so we no longer need inference_recurrent_lighter.
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import SceneHumanViewer
 
@@ -704,35 +647,60 @@ def run_inference(args):
     model.eval()
     timings["load_model"] = time.time() - t0
 
-    # Prepare input views.
-    print("Preparing input views...")
+    # Build streaming dataset + loader.
+    print("Building frame dataset...")
     t0 = time.time()
     img_res = getattr(model, 'mhmr_img_res', None)
-    views = prepare_input(
+    dataset = FrameDataset(
         img_paths=img_paths,
-        img_mask=img_mask,
         size=args.size,
-        revisit=1,
-        update=True,
         img_res=img_res,
-        reset_interval=args.reset_interval
+        reset_interval=args.reset_interval,
     )
-    timings["prepare_input_views"] = time.time() - t0
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=(args.num_workers > 0),
+        collate_fn=lambda x: x,
+    )
+    timings["build_dataset"] = time.time() - t0
 
-    if tmpdirname is not None:
-        shutil.rmtree(tmpdirname)
-
-    # Run inference.
-    print("Running inference...")
+    # Run inference, streaming one frame at a time via forward_step. Outputs
+    # still accumulate into a single dict for the existing prepare_output;
+    # iteration 2 will switch to per-chunk processing.
+    # no_grad + autocast(enabled=False) match the wrapping that
+    # inference_recurrent_lighter used to provide (inference.py).
+    print("Running inference (streaming)...")
     start_time = time.time()
-    outputs, _, _ = inference_recurrent_lighter(
-        views, model, device, use_ttt3r=args.use_ttt3r)
+    state_args = None
+    trackers = None
+    all_pred = []
+    all_views = []
+    n_processed = 0
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+        for view in _frame_iter_from_loader(loader):
+            res, state_args, trackers = model.forward_step(
+                view, device,
+                state_args=state_args, trackers=trackers,
+                use_ttt3r=args.use_ttt3r,
+            )
+            all_pred.append(res)
+            all_views.append(_strip_view_for_output(view))
+            n_processed += 1
+            if n_processed % args.chunk_size == 0:
+                print(f"  inference: {n_processed} frames")
+    outputs = dict(pred=all_pred, views=all_views)
     total_time = time.time() - start_time
     timings["run_inference"] = total_time
-    per_frame_time = total_time / len(views)
+    per_frame_time = total_time / max(n_processed, 1)
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
+
+    if tmpdirname is not None:
+        shutil.rmtree(tmpdirname)
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
