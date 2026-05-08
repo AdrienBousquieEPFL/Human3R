@@ -215,18 +215,6 @@ class FrameDataset(torch.utils.data.Dataset):
         return view
 
 
-def _frame_iter_from_loader(loader):
-    """Yields each loaded view, then yields a deepcopy overlap-view (reset=False)
-    immediately after any view whose reset==True. Reproduces the overlap-view
-    side effect of the old prepare_input loop."""
-    for view in loader:
-        yield view
-        if bool(view["reset"].item()):
-            overlap = deepcopy(view)
-            overlap["reset"] = torch.tensor(False).unsqueeze(0)
-            yield overlap
-
-
 def _strip_view_for_output(view):
     """The accumulated outputs["views"] list is only read for `img` (used to
     build colors) and `reset` (used to drop overlap-views). Keeping the rest
@@ -263,6 +251,7 @@ class ChunkProcessor:
         from src.dust3r.utils.geometry import geotrf
         from src.dust3r.utils import SMPL_Layer, vis_heatmap, render_meshes
         from src.dust3r.utils.image import unpad_image
+        from src.dust3r.utils.streaming import streaming_pose_recovery
         from viser_utils import get_color
         self._pose_encoding_to_camera = pose_encoding_to_camera
         self._estimate_focal_knowing_depth = estimate_focal_knowing_depth
@@ -271,6 +260,7 @@ class ChunkProcessor:
         self._vis_heatmap = vis_heatmap
         self._render_meshes = render_meshes
         self._unpad_image = unpad_image
+        self._streaming_pose_recovery = streaming_pose_recovery
         self._get_color = get_color
 
         self.outdir = outdir
@@ -376,28 +366,16 @@ class ChunkProcessor:
             _, self.H, self.W, _ = pts3ds_self.shape
         H, W = self.H, self.W
 
-        # Step C — pose recovery. Mirrors the old prepare_output's two
-        # branches: when no reset has ever been seen, return raw poses
-        # (bit-exact with original no-reset path); once any reset fires,
-        # apply streaming matmul carrying self.pose_base across chunks.
+        # Step C — pose recovery via shared streaming helper. Mirrors the old
+        # prepare_output's two branches (raw poses if no reset seen anywhere
+        # yet, streaming matmul once any reset fires) byte-for-byte.
         raw_poses = [
             self._pose_encoding_to_camera(p["camera_pose"].clone()).cpu()
             for p in chunk_pred
         ]  # list of [1, 4, 4]
-        chunk_has_reset = bool(reset_mask.any())
-        if not (self.any_reset_seen or chunk_has_reset):
-            pr_poses = raw_poses
-        else:
-            cur_base = self.pose_base.clone()
-            out = []
-            for i, rp in enumerate(raw_poses):
-                rp_44 = rp.squeeze(0)  # [4, 4]
-                out.append((cur_base @ rp_44).unsqueeze(0))
-                if reset_mask[i]:
-                    cur_base = cur_base @ rp_44
-            self.pose_base = cur_base
-            pr_poses = out
-        self.any_reset_seen = self.any_reset_seen or chunk_has_reset
+        pr_poses, self.pose_base, self.any_reset_seen = self._streaming_pose_recovery(
+            raw_poses, reset_mask, self.pose_base, self.any_reset_seen,
+        )
 
         # Step D — pose-transform other-view points (use_pose path).
         if self.use_pose:
@@ -780,6 +758,7 @@ def run_inference(args):
     # Import model after adding the ckpt path. Streaming inference drives
     # model.forward_step directly, so we no longer need inference_recurrent_lighter.
     from src.dust3r.model import ARCroco3DStereo
+    from src.dust3r.utils.streaming import frame_iter_from_loader
     from viser_utils import SceneHumanViewer
 
     timings = {}
@@ -855,7 +834,7 @@ def run_inference(args):
     n_chunks = 0
     chunk_inf_time = 0.0
     with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
-        for view in _frame_iter_from_loader(loader):
+        for view in frame_iter_from_loader(loader):
             t_inf = time.time()
             res, state_args, trackers = model.forward_step(
                 view, device,
