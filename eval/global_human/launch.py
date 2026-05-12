@@ -57,6 +57,19 @@ def get_args_parser():
     parser.add_argument("--use_ttt3r", action="store_true", default=False)
     parser.add_argument("--reset_interval", type=int, default=100000000)
     parser.add_argument("--use_fake_K", action="store_true", default=False)
+    parser.add_argument(
+        "--chunk_size", type=int, default=32,
+        help="Frames per inference chunk; bounds peak inference RAM.",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=0,
+        help="DataLoader workers for input frame decoding. 0 keeps everything in main process.",
+    )
+    parser.add_argument(
+        "--max_frames", type=int, default=None,
+        help="If set, truncate each sequence's filelist to this many frames "
+             "(verification convenience; leave unset for normal runs).",
+    )
     return parser
 
 def get_seq_list(metadata, img_path):
@@ -95,49 +108,6 @@ def get_file_list(metadata, img_path, seq, seq_to_images=None):
     filelist = filelist[::subsample]
     return filelist, sampled_indices
 
-def run_inference(
-        device, args, metadata, filelist, sampled_indices, annots, model, smpl_model):
-    from dust3r.inference import inference_recurrent_lighter
-    
-    get_view_func=metadata.get("get_view_func", None)
-    mask_path_func = metadata.get("mask_path_func", None)    
-    mask_path_list = mask_path_func(filelist) if mask_path_func is not None else []
-
-    views = prepare_input(
-        filelist,
-        [True for _ in filelist],
-        msk_paths=mask_path_list,
-        size=args.size,
-        crop=not args.no_crop,
-        revisit=args.revisit,
-        update=not args.freeze_state,
-        load_func=get_view_func,
-        annots=annots,
-        sampled_indices=sampled_indices,
-        reset_interval=args.reset_interval,
-        crop_res=args.crop_res
-    )
-    with torch.no_grad():
-        smpl_model.update_smpl_gt_eval(views, args.eval_dataset)     
-    gt = prepare_gt(views)
-
-    keep_keys = set(
-        ["img", "img_mask", "true_shape", "img_mhmr", "reset", "update", "K_mhmr"])
-    for i, view in enumerate(views):
-        views[i] = {key: view[key] for key in keep_keys if key in view}
-
-    outputs, _ = inference_recurrent_lighter(
-        views, model, device, verbose=False, is_naive=args.is_naive, use_ttt3r=args.use_ttt3r)
-
-    pred = prepare_output(
-        outputs, revisit=args.revisit, solve_pose=args.solve_pose, is_save=args.save)
-
-    del outputs, views
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return gt, pred
-
 def get_pred_smpl(pred, gt, f_id, is_naive, smpl_layer, mhmr_img_res, K_to_proj):
     n_humans_i = pred['shape'][f_id].shape[0]
     expand = lambda x: x.expand(n_humans_i, -1, -1)
@@ -173,21 +143,337 @@ def match_2d(pr_j2d, gt_j2d):
     # match pred to gt - based on 2d bbox
     gt_j2d = gt_j2d.numpy()
     bestMatch, falsePositives, misses = match_2d_greedy(
-        pr_j2d.numpy()[:,:gt_j2d.shape[1]], 
-        gt_j2d, 
+        pr_j2d.numpy()[:,:gt_j2d.shape[1]],
+        gt_j2d,
         np.ones_like(gt_j2d[...,0]).astype(np.bool_))
 
     update = {
         'count': len(gt_j2d),
-        'miss': len(misses), 
+        'miss': len(misses),
         'fp': len(falsePositives)
     }
 
     return bestMatch, update
 
 
+class EvalChunkProcessor:
+    """Streams the per-sequence post-processing + metric computation one chunk
+    at a time. Carries minimal state across chunks (cumulative camera-pose
+    base, overlap-drop boundary flag, frame counter, accumulating
+    counter/metrics/global_batch). The chunk's fp32 pred/gt tensors are
+    freed before the next chunk runs.
+
+    Mirrors the body of the previous prepare_output + the per-frame metric
+    body in eval_smpl_error (launch.py:308-385) byte-for-byte when the
+    streaming pose recovery hits the no-reset path (which is the common
+    case at default reset_interval).
+    """
+
+    def __init__(
+        self, args, smpl_model, smpl_layer, pelvis_idx, mhmr_img_res,
+        is_global, save_dir, seq, subsample, filelist=None,
+    ):
+        from dust3r.utils.streaming import streaming_pose_recovery
+        from dust3r.utils.camera import pose_encoding_to_camera
+        from dust3r.post_process import estimate_focal_knowing_depth
+        from dust3r.utils.image import unpad_image
+        from dust3r.utils.geometry import perspective_projection, geotrf
+
+        self._streaming_pose_recovery = streaming_pose_recovery
+        self._pose_encoding_to_camera = pose_encoding_to_camera
+        self._estimate_focal_knowing_depth = estimate_focal_knowing_depth
+        self._unpad_image = unpad_image
+        self._perspective_projection = perspective_projection
+        self._geotrf = geotrf
+
+        if args.solve_pose:
+            raise NotImplementedError(
+                "--solve_pose is not supported in streaming mode (procrustes is global)."
+            )
+
+        self.args = args
+        self.smpl_model = smpl_model
+        self.smpl_layer = smpl_layer
+        self.pelvis_idx = pelvis_idx
+        self.mhmr_img_res = mhmr_img_res
+        self.is_global = is_global
+        self.save_dir = save_dir
+        self.seq = seq
+        self.subsample = subsample
+        self.filelist = filelist
+
+        # Cross-chunk state.
+        self.pose_base = torch.eye(4)
+        self.any_reset_seen = False
+        self.prev_chunk_last_reset = False
+        self.frame_counter = 0
+
+        # Accumulators across chunks.
+        self.counter = Counter()
+        self.metrics = defaultdict(list)
+        self.global_batch = []
+
+    def _process_pred(self, chunk_pred, reset_mask):
+        """Per-chunk version of the old prepare_output body. Returns a pred
+        dict with the same keys: K, T_c2w (concatenated [B, ...]) and SMPL
+        params as per-frame lists."""
+        pts3ds_self_to_save = [p["pts3d_in_self_view"] for p in chunk_pred]
+        conf_self_ls = [p["conf_self"] for p in chunk_pred]
+        pts3ds_self = torch.cat(pts3ds_self_to_save, 0)
+
+        raw_poses = [
+            self._pose_encoding_to_camera(p["camera_pose"].clone())
+            for p in chunk_pred
+        ]  # list of [1, 4, 4]
+        # Streaming pose recovery: when no reset has fired anywhere, raw_poses
+        # are returned unchanged (bit-exact with the original no-reset branch).
+        pr_poses, self.pose_base, self.any_reset_seen = self._streaming_pose_recovery(
+            raw_poses, reset_mask, self.pose_base, self.any_reset_seen,
+        )
+        pr_poses_cat = torch.cat(pr_poses, 0)  # [B, 4, 4]
+
+        B, H, W, _ = pts3ds_self.shape
+        pp = (
+            torch.tensor([W // 2, H // 2], device=pts3ds_self.device)
+            .float()
+            .repeat(B, 1)
+            .reshape(B, 2)
+        )
+        focal = self._estimate_focal_knowing_depth(
+            pts3ds_self, pp, focal_mode="weiszfeld",
+        )
+
+        intrinsics = torch.eye(3, device=pp.device).unsqueeze(0).repeat(B, 1, 1)
+        intrinsics[:, 0, 0] = focal
+        intrinsics[:, 1, 1] = focal
+        intrinsics[:, [0, 1], 2] = pp
+
+        pred = {}
+        pred['T_c2w'] = pr_poses_cat
+        pred['K'] = intrinsics
+        pred['shape'] = [
+            p.get("smpl_shape", torch.empty(1, 0, 10))[0] for p in chunk_pred
+        ]
+        pred['rotvec'] = [
+            roma.rotmat_to_rotvec(
+                p.get("smpl_rotmat", torch.empty(1, 0, 53, 3, 3))[0]
+            )
+            for p in chunk_pred
+        ]
+        pred['transl'] = [
+            p.get("smpl_transl", torch.empty(1, 0, 3))[0] for p in chunk_pred
+        ]
+        pred['expression'] = [
+            p.get("smpl_expression", [None])[0] for p in chunk_pred
+        ]
+        pred['loc'] = [
+            p.get("smpl_loc", torch.empty(1, 0, 2))[0] for p in chunk_pred
+        ]
+
+        if self.args.save:
+            has_mask = "msk" in chunk_pred[0]
+            if has_mask:
+                msks = [p["msk"][..., 0] for p in chunk_pred]
+                msks = [self._unpad_image(m, [H, W]) for m in msks]
+            else:
+                msks = [torch.zeros(1, H, W) for _ in range(B)]
+            pred['pts3d_self'] = pts3ds_self_to_save
+            pred['conf_self'] = conf_self_ls
+            pred['msk'] = msks
+
+        return pred
+
+    def _process_gt(self, chunk_views):
+        """Per-chunk version of the old prepare_gt body."""
+        gt = defaultdict(list)
+        intrinsics = [v["camera_intrinsics"] for v in chunk_views]
+        K_mhmr = [v["K_mhmr"] for v in chunk_views]
+        camera_pose = [v["camera_pose"] for v in chunk_views]
+        imgs = [v["img"] for v in chunk_views]
+        gt['K'] = torch.cat(intrinsics, 0)
+        gt['K_mhmr'] = torch.cat(K_mhmr, 0)
+        gt['T_c2w'] = torch.cat(camera_pose, 0)
+        gt['img'] = torch.cat(imgs, 0)
+        if 'T_w2c' in chunk_views[0]:
+            T_w2c_list = [v["T_w2c"] for v in chunk_views]
+            gt['T_w2c'] = torch.cat(T_w2c_list, 0)
+        for v in chunk_views:
+            smpl_mask = v["smpl_mask"]
+            gt['v3d_c'].append(v["smpl_v3d_c"][smpl_mask])
+            gt['j3d_c'].append(v["smpl_j3d_c"][smpl_mask])
+            gt['v3d_w'].append(v["smpl_v3d_w"][smpl_mask])
+            gt['j3d_w'].append(v["smpl_j3d_w"][smpl_mask])
+            gt['v2d'].append(v["smpl_v2d"][smpl_mask])
+            gt['j2d'].append(v["smpl_j2d"][smpl_mask])
+        return gt
+
+    def process_chunk(self, chunk_pred, chunk_views):
+        """Drop overlap views at the chunk boundary, build pred + gt for the
+        chunk, run the per-frame metric body, accumulate counter / metrics /
+        global_batch."""
+        if not chunk_pred:
+            return
+
+        # Step A — cross-chunk overlap drop. Mirrors the original
+        # prepare_output's `shifted_reset_mask` logic, with the leading edge
+        # carried across chunks via self.prev_chunk_last_reset.
+        local_reset = torch.cat([v["reset"] for v in chunk_views], 0)  # [B_in]
+        prev_last_for_next = bool(local_reset[-1].item())
+        shifted = torch.cat(
+            [torch.tensor([self.prev_chunk_last_reset]), local_reset[:-1]], dim=0
+        )
+        keep = ~shifted
+        chunk_pred = [p for p, k in zip(chunk_pred, keep.tolist()) if k]
+        chunk_views = [v for v, k in zip(chunk_views, keep.tolist()) if k]
+        reset_mask = local_reset[keep]
+        self.prev_chunk_last_reset = prev_last_for_next
+        if not chunk_pred:
+            return
+
+        B = len(chunk_pred)
+
+        # Step B — build pred + gt for this chunk.
+        pred = self._process_pred(chunk_pred, reset_mask)
+        gt = self._process_gt(chunk_views)
+
+        # Step C — per-frame metric loop (mirrors launch.py:311-385).
+        K_to_proj = gt['K'] if self.args.is_naive else pred['K']
+        T_c2w = pred['T_c2w']
+
+        for f_id_local in range(B):
+            f_id_global = self.frame_counter + f_id_local
+            n_humans_i = pred['shape'][f_id_local].shape[0]
+
+            if n_humans_i > 0:
+                pred_v3d_c = get_pred_smpl(
+                    pred, gt, f_id_local, self.args.is_naive,
+                    self.smpl_layer, self.mhmr_img_res, K_to_proj,
+                )
+                pred_v3d_c = self.smpl_model.smplx2smpl @ pred_v3d_c
+                pred_j3d_c = self.smpl_model.j_regressor @ pred_v3d_c
+                pr_j2d = self._perspective_projection(
+                    pred_j3d_c, K_to_proj[f_id_local].expand(n_humans_i, -1, -1),
+                )
+            else:
+                pred_v3d_c = torch.empty(0, 6890, 3, dtype=torch.float32)
+                pr_j2d = torch.empty(0, 24, 2, dtype=torch.float32)
+
+            bestMatch, update = match_2d(pr_j2d, gt['j2d'][f_id_local])
+            self.counter.update(update)
+
+            if len(bestMatch) > 0:
+                self.counter.update({'n_human': len(bestMatch)})
+                pid, gid = bestMatch[:, 0], bestMatch[:, 1]
+
+                camcoord_batch = {
+                    "pred_j3d": pred_j3d_c[pid],
+                    "target_j3d": gt['j3d_c'][f_id_local][gid],
+                    "pred_v3d": pred_v3d_c[pid],
+                    "target_v3d": gt['v3d_c'][f_id_local][gid],
+                }
+                camcoord_metrics = eval_camcoord(camcoord_batch, self.pelvis_idx)
+                for k, v in camcoord_metrics.items():
+                    self.metrics[k].append(v)
+
+                if self.is_global:
+                    expand = lambda x: x.expand(len(bestMatch), -1, -1)
+                    self.global_batch.append({
+                        "pred_j3d": self._geotrf(
+                            expand(T_c2w[f_id_local]), pred_j3d_c[pid],
+                        ),
+                        "target_j3d": gt['j3d_w'][f_id_local][gid],
+                        "pred_v3d": self._geotrf(
+                            expand(T_c2w[f_id_local]), pred_v3d_c[pid],
+                        ),
+                        "target_v3d": gt['v3d_w'][f_id_local][gid],
+                    })
+
+            if self.args.save:
+                color = 0.5 * (gt['img'][f_id_local].permute(1, 2, 0) + 1.0)
+                out_dir = f"{self.save_dir}/{self.seq}/{f_id_global:06d}"
+                for k in ["pts3d", "conf", "color", "camera", "smpl", "mask"]:
+                    os.makedirs(os.path.join(out_dir, k), exist_ok=True)
+                np.save(
+                    os.path.join(out_dir, "pts3d", f"{f_id_global:06d}.npy"),
+                    pred['pts3d_self'][f_id_local],
+                )
+                np.save(
+                    os.path.join(out_dir, "conf", f"pred_{f_id_global:06d}.npy"),
+                    pred['conf_self'][f_id_local],
+                )
+                np.save(
+                    os.path.join(out_dir, "color", f"{f_id_global:06d}.npy"), color,
+                )
+                np.save(
+                    os.path.join(out_dir, "mask", f"pred_{f_id_global:06d}.npy"),
+                    pred['msk'][f_id_local],
+                )
+                np.savez(
+                    os.path.join(out_dir, "camera", f"pred_{f_id_global:06d}.npz"),
+                    pose=pred['T_c2w'][f_id_local], K=pred['K'][f_id_local],
+                )
+                np.savez(
+                    os.path.join(out_dir, "camera", f"gt_{f_id_global:06d}.npz"),
+                    pose=gt['T_c2w'][f_id_local], K=gt['K'][f_id_local],
+                )
+                if len(bestMatch) > 0:
+                    np.save(
+                        os.path.join(out_dir, "smpl", f"pred_{f_id_global:06d}.npy"),
+                        pred_v3d_c[pid],
+                    )
+                    np.save(
+                        os.path.join(out_dir, "smpl", f"gt_{f_id_global:06d}.npy"),
+                        gt['v3d_c'][f_id_local][gid],
+                    )
+                else:
+                    np.save(
+                        os.path.join(out_dir, "smpl", f"pred_{f_id_global:06d}.npy"),
+                        pred_v3d_c,
+                    )
+                    np.save(
+                        os.path.join(out_dir, "smpl", f"gt_{f_id_global:06d}.npy"),
+                        gt['v3d_c'][f_id_local],
+                    )
+
+            if self.args.vis:
+                img_path = (
+                    self.filelist[f_id_global]
+                    if self.filelist is not None and f_id_global < len(self.filelist)
+                    else None
+                )
+                visualize(
+                    save_dir=f"{self.save_dir}/{self.seq}",
+                    img_path=img_path,
+                    view=gt['img'][f_id_local],
+                    gt_v3d_c=gt['v3d_c'][f_id_local],
+                    pred_v3d_c=pred_v3d_c,
+                    K_to_proj=K_to_proj[f_id_local],
+                    gt_K=gt['K'][f_id_local],
+                    bestMatch=bestMatch,
+                    smpl_face=self.smpl_model.smpl_faces['smpl'],
+                )
+
+        self.frame_counter += B
+
+    def finalize(self):
+        """Compute precision/recall/F1 and (if is_global) eval_global on the
+        accumulated buffer. Returns (counter, metrics) for write_log."""
+        self.metrics['precision'], self.metrics['recall'], self.metrics['f1_score'] = compute_prf1(
+            self.counter['count'], self.counter['miss'], self.counter['fp'],
+        )
+        if self.is_global and self.global_batch:
+            global_batch_cat = {
+                k: torch.cat([b[k] for b in self.global_batch])
+                for k in self.global_batch[0]
+            }
+            global_metrics = eval_global(global_batch_cat, self.subsample)
+            for k, v in global_metrics.items():
+                self.metrics[k].append(v)
+        return self.counter, self.metrics
+
+
 def eval_smpl_error(args, model, smpl_model, smpl_layer, save_dir=None):
-    from dust3r.utils.geometry import perspective_projection, geotrf
+    from dust3r.utils.streaming import frame_iter_from_loader
 
     metadata = dataset_metadata.get(args.eval_dataset)
     img_path = metadata["img_path"]
@@ -205,6 +491,8 @@ def eval_smpl_error(args, model, smpl_model, smpl_layer, save_dir=None):
     model.to(distributed_state.device)
     device = distributed_state.device
 
+    keep_keys = {"img", "img_mask", "true_shape", "img_mhmr", "reset", "update", "K_mhmr"}
+
     with distributed_state.split_between_processes(seq_list) as seqs:
         if len(seq_list) < distributed_state.num_processes:
             if distributed_state.process_index >= len(seq_list):
@@ -215,111 +503,76 @@ def eval_smpl_error(args, model, smpl_model, smpl_layer, save_dir=None):
             try:
                 print(f"Evaluating sequence: {seq}")
                 filelist, sampled_indices = get_file_list(metadata, img_path, seq, seq_to_images)
-                gt, pred = run_inference(
-                    device, args, metadata, filelist, sampled_indices, annots, model, smpl_model)
+                if args.max_frames is not None:
+                    filelist = filelist[:args.max_frames]
+                    sampled_indices = sampled_indices[:args.max_frames]
 
-                K_to_proj = gt['K'] if args.is_naive else pred['K'] # CHOOSE ONE in: pred['K'] or gt['K']
-                T_c2w = pred['T_c2w'] # CHOOSE ONE in: pred['T_c2w'] or gt['T_c2w']
+                # Build per-sequence dataset, loader, and chunk processor.
+                get_view_func = metadata.get("get_view_func", None)
+                mask_path_func = metadata.get("mask_path_func", None)
+                mask_path_list = mask_path_func(filelist) if mask_path_func is not None else []
 
-                global_batch = []
-                metrics = defaultdict(list)
-                counter = Counter()
-                for f_id in range(len(filelist)):
-                    n_humans_i = pred['shape'][f_id].shape[0]
-                    if n_humans_i > 0:
-                        pred_v3d_c = get_pred_smpl(
-                            pred, gt, f_id, args.is_naive, smpl_layer, mhmr_img_res, K_to_proj)
+                dataset = EvalFrameDataset(
+                    img_paths=filelist,
+                    msk_paths=mask_path_list,
+                    size=args.size,
+                    crop=not args.no_crop,
+                    load_func=get_view_func,
+                    annots=annots,
+                    sampled_indices=sampled_indices,
+                    reset_interval=args.reset_interval,
+                    crop_res=args.crop_res,
+                )
+                loader = torch.utils.data.DataLoader(
+                    dataset, batch_size=None, num_workers=args.num_workers,
+                    pin_memory=True, persistent_workers=(args.num_workers > 0),
+                    collate_fn=lambda x: x,
+                )
 
-                        pred_v3d_c = smpl_model.smplx2smpl @ pred_v3d_c
-                        pred_j3d_c = smpl_model.j_regressor @ pred_v3d_c
-                        pr_j2d = perspective_projection(
-                            pred_j3d_c, K_to_proj[f_id].expand(n_humans_i, -1 , -1))
-                    else:
-                        pred_v3d_c = torch.empty(0, 6890, 3, dtype=torch.float32)
-                        pr_j2d = torch.empty(0, 24, 2, dtype=torch.float32)
-                    
-                    bestMatch, update = match_2d(pr_j2d, gt['j2d'][f_id])
-                    counter.update(update)
+                processor = EvalChunkProcessor(
+                    args=args, smpl_model=smpl_model, smpl_layer=smpl_layer,
+                    pelvis_idx=pelvis_idx, mhmr_img_res=mhmr_img_res,
+                    is_global=is_global, save_dir=save_dir, seq=seq,
+                    subsample=subsample, filelist=filelist,
+                )
 
-                    # 3d metrics
-                    if len(bestMatch) > 0:
-                        counter.update({'n_human': len(bestMatch)})
-                        pid, gid = bestMatch[:, 0], bestMatch[:, 1]
+                # Streaming inference + chunk processing. Per-frame: enrich GT
+                # via update_smpl_gt_eval, strip to inference-only keys, run
+                # forward_step, accumulate one chunk's worth, flush.
+                state_args, trackers = None, None
+                chunk_pred, chunk_views = [], []
+                with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                    for view in frame_iter_from_loader(loader):
+                        smpl_model.update_smpl_gt_eval([view], args.eval_dataset)
+                        inf_view = {k: view[k] for k in keep_keys if k in view}
+                        res, state_args, trackers = model.forward_step(
+                            inf_view, device,
+                            state_args=state_args, trackers=trackers,
+                            use_ttt3r=args.use_ttt3r,
+                        )
+                        chunk_pred.append(res)
+                        chunk_views.append(view)
+                        if len(chunk_pred) >= args.chunk_size:
+                            processor.process_chunk(chunk_pred, chunk_views)
+                            chunk_pred.clear()
+                            chunk_views.clear()
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                    if chunk_pred:
+                        processor.process_chunk(chunk_pred, chunk_views)
+                        chunk_pred.clear()
+                        chunk_views.clear()
 
-                        # camera coordinate metrics
-                        camcoord_batch = {
-                            "pred_j3d": pred_j3d_c[pid],
-                            "target_j3d": gt['j3d_c'][f_id][gid],
-                            "pred_v3d": pred_v3d_c[pid],
-                            "target_v3d": gt['v3d_c'][f_id][gid],
-                        }
-                        camcoord_metrics = eval_camcoord(camcoord_batch, pelvis_idx)
+                counter, metrics = processor.finalize()
 
-                        for k, v in camcoord_metrics.items():
-                            metrics[k].append(v)
-
-                        if is_global:
-                            expand = lambda x: x.expand(len(bestMatch), -1, -1)
-                            global_batch.append({
-                                "pred_j3d": geotrf(expand(T_c2w[f_id]), pred_j3d_c[pid]),
-                                "target_j3d": gt['j3d_w'][f_id][gid],
-                                "pred_v3d": geotrf(expand(T_c2w[f_id]), pred_v3d_c[pid]),
-                                "target_v3d": gt['v3d_w'][f_id][gid],
-                            })
-
-                    if args.save:
-                        color = 0.5 * (gt['img'][f_id].permute(1, 2, 0) + 1.0)
-                        out_dir = f"{save_dir}/{seq}/{f_id:06d}"
-                        for k in ["pts3d", "conf", "color", "camera", "smpl", "mask"]:
-                            os.makedirs(os.path.join(out_dir, k), exist_ok=True)
-                        np.save(os.path.join(out_dir, "pts3d", f"{f_id:06d}.npy"), pred['pts3d_self'][f_id])
-                        np.save(os.path.join(out_dir, "conf", f"pred_{f_id:06d}.npy"), pred['conf_self'][f_id])
-                        np.save(os.path.join(out_dir, "color", f"{f_id:06d}.npy"), color)
-                        np.save(os.path.join(out_dir, "mask", f"pred_{f_id:06d}.npy"), pred['msk'][f_id])
-                        np.savez(os.path.join(out_dir, "camera", f"pred_{f_id:06d}.npz"), 
-                                pose=pred['T_c2w'][f_id], K=pred['K'][f_id])
-                        np.savez(os.path.join(out_dir, "camera", f"gt_{f_id:06d}.npz"), 
-                                pose=gt['T_c2w'][f_id], K=gt['K'][f_id])
-                        if len(bestMatch) > 0:
-                            np.save(os.path.join(out_dir, "smpl", f"pred_{f_id:06d}.npy"), pred_v3d_c[pid])
-                            np.save(os.path.join(out_dir, "smpl", f"gt_{f_id:06d}.npy"), gt['v3d_c'][f_id][gid])
-                        else:
-                            np.save(os.path.join(out_dir, "smpl", f"pred_{f_id:06d}.npy"), pred_v3d_c)
-                            np.save(os.path.join(out_dir, "smpl", f"gt_{f_id:06d}.npy"), gt['v3d_c'][f_id])
-
-                    if args.vis:
-                        visualize(
-                            save_dir=f"{save_dir}/{seq}",
-                            img_path=filelist[f_id],
-                            view=gt['img'][f_id],
-                            gt_v3d_c=gt['v3d_c'][f_id],
-                            pred_v3d_c=pred_v3d_c,
-                            K_to_proj=K_to_proj[f_id],
-                            gt_K=gt['K'][f_id],
-                            bestMatch=bestMatch,
-                            smpl_face=smpl_model.smpl_faces['smpl'],
-                            )
-
-                metrics['precision'], metrics['recall'], metrics['f1_score']= compute_prf1(
-                    counter['count'], counter['miss'], counter['fp'])
-                 
-                # global coordinate metrics
-                if is_global:
-                    global_batch = {k: torch.cat([b[k] for b in global_batch]) for k in global_batch[0]}
-                    global_metrics = eval_global(global_batch, subsample)
-                    for k, v in global_metrics.items():
-                        metrics[k].append(v)
-                        
                 torch.cuda.empty_cache()
 
                 # Write to error log after each sequence
                 os.makedirs(save_dir, exist_ok=True)
                 write_log(error_log_path, args.eval_dataset, seq, counter, metrics)
 
-                del gt, pred, filelist, sampled_indices
-                del global_batch, metrics, counter
-                if 'global_metrics' in locals():
-                    del global_metrics
+                del processor, dataset, loader, counter, metrics
+                del filelist, sampled_indices, state_args, trackers
                 gc.collect()
 
 
@@ -455,291 +708,73 @@ if __name__ == "__main__":
 
         return image_tensor, intrinsics_tensor
 
-    def prepare_input(
-        img_paths,
-        img_mask,
-        msk_paths,
-        size,
-        raymaps=None,
-        raymap_mask=None,
-        revisit=1,
-        update=True,
-        crop=True,
-        load_func=None,
-        annots=None,
-        sampled_indices=None,
-        reset_interval=100,
-        crop_res=None
-    ):
-        images = load_images(img_paths, size=size, verbose=False, crop=crop)
-        images = load_func((img_paths, images, annots, sampled_indices))
+    class EvalFrameDataset(torch.utils.data.Dataset):
+        """Lazily produces one view dict per frame for the eval streaming pipeline.
 
-        has_msk = len(msk_paths) > 0
-        if has_msk:
-            msks = load_masks(msk_paths, size=size, verbose=False, crop=crop)
+        Mirrors the no-raymap branch of the previous prepare_input (above), but
+        loads one frame at a time via load_images on a single-element list and
+        drops the [1, 6, H, W] NaN ray_map placeholder, which is unused on the
+        lighter inference path (forward_step / _recurrent_rollout never read it).
+        """
 
-        views = []
-        if raymaps is None and raymap_mask is None:
-            num_views = len(images)
+        def __init__(
+            self, img_paths, msk_paths, size, crop, load_func, annots,
+            sampled_indices, reset_interval, crop_res,
+        ):
+            self.img_paths = list(img_paths)
+            self.msk_paths = list(msk_paths) if msk_paths else []
+            self.size = size
+            self.crop = crop
+            self.load_func = load_func
+            self.annots = annots
+            self.sampled_indices = list(sampled_indices)
+            self.reset_interval = reset_interval
+            self.crop_res = crop_res
 
-            for i in range(num_views):
-                view = {
-                    "img": images[i]["img"],
-                    "ray_map": torch.full(
-                        (
-                            images[i]["img"].shape[0],
-                            6,
-                            images[i]["img"].shape[-2],
-                            images[i]["img"].shape[-1],
-                        ),
-                        torch.nan,
-                    ),
-                    "true_shape": torch.from_numpy(images[i]["true_shape"]),
-                    "idx": i,
-                    "instance": str(i),
-                    "camera_pose": torch.from_numpy(
-                        images[i]["camera_pose"]
-                    ).unsqueeze(0),
-                    "camera_intrinsics": torch.from_numpy(
-                        images[i]["intrinsics"]
-                    ).unsqueeze(0),
-                    "img_mask": torch.tensor(True).unsqueeze(0),
-                    "ray_mask": torch.tensor(False).unsqueeze(0),
-                    "update": torch.tensor(True).unsqueeze(0),
-                    "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-                }
-                
-                if crop_res is not None:
-                    view["img"], view["camera_intrinsics"] = _crop_resize(
-                        images[i]["img"], images[i]["intrinsics"], crop_res)
-                    # update true_shape to reflect cropped image size (H, W)
-                    view["true_shape"] = torch.tensor([view["img"].shape[-2:]], dtype=torch.int32)
+        def __len__(self):
+            return len(self.img_paths)
 
-                if has_msk:
-                    view["msk"] = msks[i]
-                for key in images[i].keys():
-                    if key.startswith(("smpl", "T_w2c")):
-                        view[key] = torch.tensor(images[i][key]).unsqueeze(0)
-                views.append(view)
-                if (i+1) % reset_interval == 0:
-                    overlap_view = deepcopy(view)
-                    overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                    views.append(overlap_view)
-
-        else:
-
-            num_views = len(images) + len(raymaps)
-            assert len(img_mask) == len(raymap_mask) == num_views
-            assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
-
-            j = 0
-            k = 0
-            for i in range(num_views):
-                view = {
-                    "img": (
-                        images[j]["img"]
-                        if img_mask[i]
-                        else torch.full_like(images[0]["img"], torch.nan)
-                    ),
-                    "ray_map": (
-                        raymaps[k]
-                        if raymap_mask[i]
-                        else torch.full_like(raymaps[0], torch.nan)
-                    ),
-                    "true_shape": (
-                        torch.from_numpy(images[j]["true_shape"])
-                        if img_mask[i]
-                        else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]]))
-                    ),
-                    "idx": i,
-                    "instance": str(i),
-                    "camera_pose": torch.from_numpy(
-                        images[i]["camera_pose"]
-                    ).unsqueeze(0),
-                    "camera_intrinsics": torch.from_numpy(
-                        images[i]["intrinsics"]
-                    ).unsqueeze(0),
-                    "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
-                    "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
-                    "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                    "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-                }
-
-                if crop_res is not None:
-                    view["img"], view["camera_intrinsics"] = _crop_resize(
-                        images[i]["img"], images[i]["intrinsics"], crop_res)
-                    # update true_shape to reflect cropped image size (H, W)
-                    view["true_shape"] = torch.tensor([view["img"].shape[-2:]], dtype=torch.int32)
-
-                if has_msk:
-                    view["msk"] = (
-                        msks[j]
-                        if img_mask[i]
-                        else torch.full_like(images[0]["img"], torch.nan)
-                    )
-                for key in images[i].keys():
-                    if key.startswith(("smpl", "T_w2c")):
-                        view[key] = torch.tensor(images[i][key]).unsqueeze(0)
-                
-                if img_mask[i]:
-                    j += 1
-                if raymap_mask[i]:
-                    k += 1
-                views.append(view)
-                if (i+1) % reset_interval == 0:
-                    overlap_view = deepcopy(view)
-                    overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                    views.append(overlap_view)
-            assert j == len(images) and k == len(raymaps)
-
-        if revisit > 1:
-            # repeat input for 'revisit' times
-            new_views = []
-            for r in range(revisit):
-                for i in range(len(views)):
-                    new_view = deepcopy(views[i])
-                    new_view["idx"] = r * len(views) + i
-                    new_view["instance"] = str(r * len(views) + i)
-                    if r > 0:
-                        if not update:
-                            new_view["update"] = torch.tensor(False).unsqueeze(0)
-                    new_views.append(new_view)
-            return new_views
-        
-        del images
-        return views
-
-    def prepare_gt(gts, revisit=1):
-        target_out = defaultdict(list)
-
-        valid_length = len(gts) // revisit
-        gts = gts[-valid_length:]
-
-        # delet overlaps: reset_mask=True
-        gts = [gt for gt in gts if not gt["reset"]]
-
-        intrinsics = [gt["camera_intrinsics"] for gt in gts]
-        K_mhmr = [gt["K_mhmr"] for gt in gts]
-        camera_pose = [gt["camera_pose"] for gt in gts]
-        imgs = [gt["img"] for gt in gts]
-        target_out['K'] = torch.cat(intrinsics, 0)
-        target_out['K_mhmr'] = torch.cat(K_mhmr, 0)
-        target_out['T_c2w'] = torch.cat(camera_pose, 0)
-        target_out['img'] = torch.cat(imgs, 0)
-        if 'T_w2c' in gts[0]:
-            T_w2c_list = [gt["T_w2c"] for gt in gts]
-            target_out['T_w2c'] = torch.cat(T_w2c_list, 0)
-
-        smpl_mask_list = [gt["smpl_mask"] for gt in gts]
-        for gt, smpl_mask in zip(gts, smpl_mask_list):
-            target_out['v3d_c'].append(gt["smpl_v3d_c"][smpl_mask])
-            target_out['j3d_c'].append(gt["smpl_j3d_c"][smpl_mask])
-            target_out['v3d_w'].append(gt["smpl_v3d_w"][smpl_mask])
-            target_out['j3d_w'].append(gt["smpl_j3d_w"][smpl_mask])
-            target_out['v2d'].append(gt["smpl_v2d"][smpl_mask])
-            target_out['j2d'].append(gt["smpl_j2d"][smpl_mask])
-        
-        del gts
-        return target_out
-    
-    def prepare_output(outputs, revisit=1, solve_pose=False, is_save=False):
-        pred_out = defaultdict(list)
-
-        valid_length = len(outputs["pred"]) // revisit
-        outputs["pred"] = outputs["pred"][-valid_length:]
-        outputs["views"] = outputs["views"][-valid_length:]
-
-        # delet overlaps: reset_mask=True outputs["pred"] and outputs["views"]
-        reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
-        shifted_reset_mask = torch.cat([torch.tensor(False).unsqueeze(0), reset_mask[:-1]], dim=0)
-        outputs["pred"] = [
-            pred for pred, mask in zip(outputs["pred"], shifted_reset_mask) if not mask]
-        reset_mask = reset_mask[~shifted_reset_mask]
-
-        if solve_pose:
-            pts3ds_self_to_save = [
-                output["pts3d_in_self_view"] for output in outputs["pred"]
-            ]
-            pts3ds_other = [
-                output["pts3d_in_other_view"] for output in outputs["pred"]
-            ]
-            conf_self = [output["conf_self"] for output in outputs["pred"]]
-            conf_other = [output["conf"] for output in outputs["pred"]]
-            pr_poses, focal, pp = recover_cam_params(
-                torch.cat(pts3ds_self_to_save, 0),
-                torch.cat(pts3ds_other, 0),
-                torch.cat(conf_self, 0),
-                torch.cat(conf_other, 0),
+        def __getitem__(self, i):
+            images = load_images(
+                [self.img_paths[i]], size=self.size, verbose=False, crop=self.crop,
             )
-            pts3ds_self = torch.cat(pts3ds_self_to_save, 0)
-        else:
-            pts3ds_self_to_save = [
-                output["pts3d_in_self_view"] for output in outputs["pred"]
-            ]
-            pts3ds_other = [
-                output["pts3d_in_other_view"] for output in outputs["pred"]
-            ]
-            conf_self = [output["conf_self"] for output in outputs["pred"]]
-            conf_other = [output["conf"] for output in outputs["pred"]]
-            pts3ds_self = torch.cat(pts3ds_self_to_save, 0)
-            pr_poses = [
-                pose_encoding_to_camera(pred["camera_pose"].clone())
-                for pred in outputs["pred"]
-            ]
-            pr_poses = torch.cat(pr_poses, 0)
-
-            B, H, W, _ = pts3ds_self.shape
-            pp = (
-                torch.tensor([W // 2, H // 2], device=pts3ds_self.device)
-                .float()
-                .repeat(B, 1)
-                .reshape(B, 2)
+            images = self.load_func(
+                ([self.img_paths[i]], images, self.annots, [self.sampled_indices[i]]),
             )
-            focal = estimate_focal_knowing_depth(
-                pts3ds_self, pp, focal_mode="weiszfeld"
-            )
+            image = images[0]
 
-        if is_save:
-            has_mask = "msk" in outputs["pred"][0]
-            if has_mask:
-                msks = [output["msk"][...,0] for output in outputs["pred"]]
-                msks = [unpad_image(m, [H, W]) for m in msks]
-            else:
-                msks = [torch.zeros(1, H, W) for _ in range(B)]
+            view = {
+                "img": image["img"],
+                "true_shape": torch.from_numpy(image["true_shape"]),
+                "idx": i,
+                "instance": str(i),
+                "camera_pose": torch.from_numpy(image["camera_pose"]).unsqueeze(0),
+                "camera_intrinsics": torch.from_numpy(image["intrinsics"]).unsqueeze(0),
+                "img_mask": torch.tensor(True).unsqueeze(0),
+                "ray_mask": torch.tensor(False).unsqueeze(0),
+                "update": torch.tensor(True).unsqueeze(0),
+                "reset": torch.tensor((i + 1) % self.reset_interval == 0).unsqueeze(0),
+            }
 
-            pred_out["pts3d_self"] = pts3ds_self_to_save
-            pred_out["conf_self"] = conf_self
-            pred_out["msk"] = msks
+            if self.crop_res is not None:
+                view["img"], view["camera_intrinsics"] = _crop_resize(
+                    image["img"], image["intrinsics"], self.crop_res,
+                )
+                view["true_shape"] = torch.tensor(
+                    [view["img"].shape[-2:]], dtype=torch.int32,
+                )
 
-        if reset_mask.any():
-            identity = torch.eye(4, device=pr_poses.device)
-            reset_poses = torch.where(reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity)
-            cumulative_bases = matrix_cumprod(reset_poses)
-            shifted_bases = torch.cat([identity.unsqueeze(0), cumulative_bases[:-1]], dim=0)
-            pr_poses = torch.einsum('bij,bjk->bik', shifted_bases, pr_poses)
-        pred_out['T_c2w'] = pr_poses
+            if self.msk_paths:
+                msks = load_masks(
+                    [self.msk_paths[i]], size=self.size, verbose=False, crop=self.crop,
+                )
+                view["msk"] = msks[0]
 
-        intrinsics = torch.eye(3, device=pp.device).unsqueeze(0).repeat(B, 1, 1)
-        intrinsics[:, 0, 0] = focal  # fx
-        intrinsics[:, 1, 1] = focal  # fy
-        intrinsics[:, [0, 1], 2] = pp
-        pred_out['K'] = intrinsics
+            for key in image.keys():
+                if key.startswith(("smpl", "T_w2c")):
+                    view[key] = torch.tensor(image[key]).unsqueeze(0)
 
-        # get SMPL parameters from outputs
-        pred_out['shape'] = [output.get(
-            "smpl_shape", torch.empty(1,0,10))[0] for output in outputs["pred"]]
-        pred_out['rotvec'] = [roma.rotmat_to_rotvec(output.get(
-                "smpl_rotmat", torch.empty(1,0,53,3,3))[0]) for output in outputs["pred"]]
-        pred_out['transl'] = [output.get(
-            "smpl_transl", torch.empty(1,0,3))[0] for output in outputs["pred"]]
-        pred_out['expression'] = [output.get(
-            "smpl_expression", [None])[0] for output in outputs["pred"]]
-        pred_out['loc'] = [output.get(
-            "smpl_loc", torch.empty(1,0,2))[0] for output in outputs["pred"]]
-        
-        del outputs
-        return pred_out
-
+            return view
 
     model = ARCroco3DStereo.from_pretrained(args.weights)
     # SMPL model for gt

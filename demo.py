@@ -159,458 +159,540 @@ def parse_args():
         default=10,
         help="Mask morphology for the viewer",
     )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=32,
+        help="Frames processed per inference chunk. Bounds peak input/output RAM.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader workers for input frame decoding. 0 keeps everything in main process.",
+    )
     return parser.parse_args()
 
 
-def prepare_input(
-    img_paths, 
-    img_mask, 
-    size, 
-    raymaps=None, 
-    raymap_mask=None, 
-    revisit=1, 
-    update=True, 
-    img_res=None, 
-    reset_interval=100
-):
+class FrameDataset(torch.utils.data.Dataset):
+    """Lazily produces one view dict per frame for the demo's streaming pipeline.
+
+    Mirrors the no-raymap branch of the previous prepare_input but drops the
+    [1, 6, H, W] NaN ray_map placeholder, which is unused on the lighter
+    inference path (forward_step / _recurrent_rollout never read it).
     """
-    Prepare input views for inference from a list of image paths.
 
-    Args:
-        img_paths (list): List of image file paths.
-        img_mask (list of bool): Flags indicating valid images.
-        size (int): Target image size.
-        raymaps (list, optional): List of ray maps.
-        raymap_mask (list, optional): Flags indicating valid ray maps.
-        revisit (int): How many times to revisit each view.
-        update (bool): Whether to update the state on revisits.
+    def __init__(self, img_paths, size, img_res=None, reset_interval=10000000):
+        self.img_paths = list(img_paths)
+        self.size = size
+        self.img_res = img_res
+        self.reset_interval = reset_interval
+        self._K_mhmr = None
+        if img_res is not None:
+            from dust3r.utils.geometry import get_camera_parameters
+            self._K_mhmr = get_camera_parameters(img_res, device="cpu")
 
-    Returns:
-        list: A list of view dictionaries.
-    """
-    # Import image loader (delayed import needed after adding ckpt path).
-    from src.dust3r.utils.image import load_images, pad_image
-    from dust3r.utils.geometry import get_camera_parameters
+    def __len__(self):
+        return len(self.img_paths)
 
-    images = load_images(img_paths, size=size)
-    if img_res is not None:
-        K_mhmr = get_camera_parameters(img_res, device="cpu") # if use pseudo K
+    def __getitem__(self, i):
+        from src.dust3r.utils.image import load_images, pad_image
+        img_dict = load_images([self.img_paths[i]], size=self.size, verbose=False)[0]
+        view = {
+            "img": img_dict["img"],
+            "true_shape": torch.from_numpy(img_dict["true_shape"]),
+            "idx": i,
+            "instance": str(i),
+            "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(0),
+            "img_mask": torch.tensor(True).unsqueeze(0),
+            "ray_mask": torch.tensor(False).unsqueeze(0),
+            "update": torch.tensor(True).unsqueeze(0),
+            "reset": torch.tensor((i + 1) % self.reset_interval == 0).unsqueeze(0),
+        }
+        if self.img_res is not None:
+            view["img_mhmr"] = pad_image(view["img"], self.img_res)
+            view["K_mhmr"] = self._K_mhmr
+        return view
 
-    views = []
-    if raymaps is None and raymap_mask is None:
-        # Only images are provided.
-        for i in range(len(images)):
-            view = {
-                "img": images[i]["img"],
-                "ray_map": torch.full(
-                    (
-                        images[i]["img"].shape[0],
-                        6,
-                        images[i]["img"].shape[-2],
-                        images[i]["img"].shape[-1],
-                    ),
-                    torch.nan,
-                ),
-                "true_shape": torch.from_numpy(images[i]["true_shape"]),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(
-                    np.eye(4, dtype=np.float32)
-                    ).unsqueeze(0),
-                "img_mask": torch.tensor(True).unsqueeze(0),
-                "ray_mask": torch.tensor(False).unsqueeze(0),
-                "update": torch.tensor(True).unsqueeze(0),
-                "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-            }
-            if img_res is not None:
-                view["img_mhmr"] = pad_image(view["img"], img_res)
-                view["K_mhmr"] = K_mhmr
-            views.append(view)
-            if (i+1) % reset_interval == 0:
-                overlap_view = deepcopy(view)
-                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                views.append(overlap_view)
-    else:
-        # Combine images and raymaps.
-        num_views = len(images) + len(raymaps)
-        assert len(img_mask) == len(raymap_mask) == num_views
-        assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
 
-        j = 0
-        k = 0
-        for i in range(num_views):
-            view = {
-                "img": (
-                    images[j]["img"]
-                    if img_mask[i]
-                    else torch.full_like(images[0]["img"], torch.nan)
-                ),
-                "ray_map": (
-                    raymaps[k]
-                    if raymap_mask[i]
-                    else torch.full_like(raymaps[0], torch.nan)
-                ),
-                "true_shape": (
-                    torch.from_numpy(images[j]["true_shape"])
-                    if img_mask[i]
-                    else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]]))
-                ),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(
-                    np.eye(4, dtype=np.float32)
-                    ).unsqueeze(0),
-                "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
-                "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
-                "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                "reset": torch.tensor((i+1) % reset_interval == 0).unsqueeze(0),
-            }
-            if img_res is not None:
-                view["img_mhmr"] = pad_image(view["img"], img_res)
-                view["K_mhmr"] = K_mhmr
-            if img_mask[i]:
-                j += 1
-            if raymap_mask[i]:
-                k += 1
-            views.append(view)
-            if (i+1) % reset_interval == 0:
-                overlap_view = deepcopy(view)
-                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
-                views.append(overlap_view)
-        assert j == len(images) and k == len(raymaps)
-
-    if revisit > 1:
-        new_views = []
-        for r in range(revisit):
-            for i, view in enumerate(views):
-                new_view = deepcopy(view)
-                new_view["idx"] = r * len(views) + i
-                new_view["instance"] = str(r * len(views) + i)
-                if r > 0 and not update:
-                    new_view["update"] = torch.tensor(False).unsqueeze(0)
-                new_views.append(new_view)
-        return new_views
-
-    return views
-
-def prepare_output(
-        outputs, outdir, revisit=1, use_pose=True,
-        save=False, render=False, render_video=False, img_res=None, subsample=1,
-        device='cuda', compute_vsmpl_metric=False):
-    """
-    Process inference outputs to generate point clouds and camera parameters for visualization.
-
-    Args:
-        outputs (dict): Inference outputs.
-        revisit (int): Number of revisits per view.
-        use_pose (bool): Whether to transform points using camera pose.
-        save (bool): Whether to save output results.
-        render (bool): Whether to save smpl mesh projection.
-        render_video (bool): Whether to save smpl mesh projection video.
-    """
-    from src.dust3r.utils.camera import pose_encoding_to_camera
-    from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.geometry import geotrf, matrix_cumprod
-    from src.dust3r.utils import SMPL_Layer, vis_heatmap, render_meshes
-    from src.dust3r.utils.image import unpad_image
-    from viser_utils import get_color
-
-    # Only keep the outputs corresponding to one full pass.
-    valid_length = len(outputs["pred"]) // revisit
-    outputs["pred"] = outputs["pred"][-valid_length:]
-    outputs["views"] = outputs["views"][-valid_length:]
-
-    # delet overlaps: reset_mask=True outputs["pred"] and outputs["views"]
-    reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
-    shifted_reset_mask = torch.cat([torch.tensor(False).unsqueeze(0), reset_mask[:-1]], dim=0)
-    outputs["pred"] = [
-        pred for pred, mask in zip(outputs["pred"], shifted_reset_mask) if not mask]
-    outputs["views"] = [
-        view for view, mask in zip(outputs["views"], shifted_reset_mask) if not mask]
-    reset_mask = reset_mask[~shifted_reset_mask]
-
-    pts3ds_self_ls = [output["pts3d_in_self_view"] for output in outputs["pred"]]
-    pts3ds_other = [output["pts3d_in_other_view"] for output in outputs["pred"]]
-    conf_self = [output["conf_self"] for output in outputs["pred"]]
-    conf_other = [output["conf"] for output in outputs["pred"]]
-    pts3ds_self = torch.cat(pts3ds_self_ls, 0)
-
-    # Recover camera poses.
-    pr_poses = [
-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-        for pred in outputs["pred"]
-    ]
-
-    # reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
-    if reset_mask.any():
-        pr_poses = torch.cat(pr_poses, 0)
-        identity = torch.eye(4, device=pr_poses.device)
-        reset_poses = torch.where(reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity)
-        cumulative_bases = matrix_cumprod(reset_poses)
-        shifted_bases = torch.cat([identity.unsqueeze(0), cumulative_bases[:-1]], dim=0)
-        pr_poses = torch.einsum('bij,bjk->bik', shifted_bases, pr_poses)
-        # keeps only reset_mask=False pr_poses
-        pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
-
-    R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
-    t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
-
-    if use_pose:
-        transformed_pts3ds_other = []
-        for pose, pself in zip(pr_poses, pts3ds_self):
-            transformed_pts3ds_other.append(geotrf(pose, pself.unsqueeze(0)))
-        pts3ds_other = transformed_pts3ds_other
-        conf_other = conf_self
-
-    # Estimate focal length based on depth.
-    B, H, W, _ = pts3ds_self.shape
-    pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
-    focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
-
-    colors = [
-        0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0) for output in outputs["views"]
-    ]
-
-    cam_dict = {
-        "focal": focal.numpy(),
-        "pp": pp.numpy(),
-        "R": R_c2w.numpy(),
-        "t": t_c2w.numpy(),
+def _strip_view_for_output(view):
+    """The accumulated outputs["views"] list is only read for `img` (used to
+    build colors) and `reset` (used to drop overlap-views). Keeping the rest
+    in the accumulator wastes ~8 MB/frame at size=512."""
+    return {
+        "img": view["img"].detach().cpu(),
+        "reset": view["reset"].detach().cpu(),
     }
 
-    pts3ds_self_tosave = pts3ds_self  # B, H, W, 3
-    depths_tosave = pts3ds_self_tosave[..., 2]
-    pts3ds_other_tosave = torch.cat(pts3ds_other)  # B, H, W, 3
-    conf_self_tosave = torch.cat(conf_self)  # B, H, W
-    conf_other_tosave = torch.cat(conf_other)  # B, H, W
-    colors_tosave = torch.cat(
-        [
-            0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0)
-            for output in outputs["views"]
-        ]
-    )  # [B, H, W, 3]
-    cam2world_tosave = torch.cat(pr_poses)  # B, 4, 4
-    intrinsics_tosave = (
-        torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
-    )  # B, 3, 3
-    intrinsics_tosave[:, 0, 0] = focal.detach()
-    intrinsics_tosave[:, 1, 1] = focal.detach()
-    intrinsics_tosave[:, 0, 2] = pp[:, 0]
-    intrinsics_tosave[:, 1, 2] = pp[:, 1]
+class ChunkProcessor:
+    """Streams output post-processing one chunk at a time.
 
-    # get SMPL parameters from outputs
-    smpl_shape = [output.get(
-        "smpl_shape", torch.empty(1,0,10))[0] for output in outputs["pred"]]
-    smpl_rotvec = [roma.rotmat_to_rotvec(
-        output.get(
-            "smpl_rotmat", torch.empty(1,0,53,3,3))[0]) for output in outputs["pred"]]
-    smpl_transl = [output.get(
-        "smpl_transl", torch.empty(1,0,3))[0] for output in outputs["pred"]]
-    smpl_expression = [output.get(
-        "smpl_expression", [None])[0] for output in outputs["pred"]]
-    smpl_id = [output.get(
-        "smpl_id", torch.empty(1,0))[0] for output in outputs["pred"]]
-    # smpl_loc = [output.get(
-    #     "smpl_loc", torch.empty(1,0,2))[0] for output in outputs["pred"]]
-    # K_mhmr = [output.get(
-    #     "K_mhmr", torch.empty(1,0,3))[0] for output in outputs["views"]]
-        
-    if render or save:
-        smpl_scores = [
-            output.get("smpl_scores", torch.zeros(1, H, W, 1))[...,0] for output in outputs["pred"]]
-        if img_res is not None:
-            smpl_scores = [
-                unpad_image(s, [H, W])[0] for s in smpl_scores]
+    Carries minimal state across chunks (cumulative camera-pose base, overlap
+    drop boundary flag, frame index, lazily-built SMPL layer). Per-frame
+    artifacts go directly into the viewer payload at fp16/uint8 — saved
+    files (--save) stay at fp32, byte-identical with the previous
+    one-shot prepare_output.
+    """
 
-    has_mask = "msk" in outputs["pred"][0]
-    if has_mask:
-        msks = [output["msk"][...,0] for output in outputs["pred"]]
-        if img_res is not None:
-            msks = [unpad_image(m, [H, W]) for m in msks]
-    else:
-        msks = [torch.zeros(1, H, W) for _ in range(B)]
+    def __init__(
+        self,
+        outdir,
+        save=False,
+        render=False,
+        render_video=False,
+        img_res=None,
+        subsample=1,
+        device='cuda',
+        compute_vsmpl_metric=False,
+        use_pose=True,
+    ):
+        from src.dust3r.utils.camera import pose_encoding_to_camera
+        from src.dust3r.post_process import estimate_focal_knowing_depth
+        from src.dust3r.utils.geometry import geotrf
+        from src.dust3r.utils import SMPL_Layer, vis_heatmap, render_meshes
+        from src.dust3r.utils.image import unpad_image
+        from src.dust3r.utils.streaming import streaming_pose_recovery
+        from viser_utils import get_color
+        self._pose_encoding_to_camera = pose_encoding_to_camera
+        self._estimate_focal_knowing_depth = estimate_focal_knowing_depth
+        self._geotrf = geotrf
+        self._SMPL_Layer = SMPL_Layer
+        self._vis_heatmap = vis_heatmap
+        self._render_meshes = render_meshes
+        self._unpad_image = unpad_image
+        self._streaming_pose_recovery = streaming_pose_recovery
+        self._get_color = get_color
 
-    # SMPL layer
-    smpl_layer = SMPL_Layer(type='smplx',
-                            gender='neutral',
-                            num_betas=smpl_shape[0].shape[-1],
-                            kid=False,
-                            person_center='head')
-    smpl_faces = smpl_layer.bm_x.faces
+        self.outdir = outdir
+        self.save = save
+        self.render = render
+        self.render_video = render_video
+        self.img_res = img_res
+        self.subsample = subsample
+        self.device = device
+        self.compute_vsmpl_metric = compute_vsmpl_metric
+        self.use_pose = use_pose
 
-    if compute_vsmpl_metric:
-        attach_volume(smpl_layer.bm_x, pretrained=True, device=device)
-        vol_device = next(smpl_layer.bm_x.volume.parameters()).device
-        smpl_layer.to(vol_device)
-        # Pre-move every tensor consumed by the per-frame volume query so we don't pay a
-        # host->device transfer on each iteration. CPU originals are still referenced for
-        # numpy / viewer code below.
-        intrinsics_dev = intrinsics_tosave.to(vol_device)
-        pts3ds_other_dev = pts3ds_other_tosave.to(vol_device)
-        pr_poses_dev = [p.to(vol_device) for p in pr_poses]
-        msks_dev = [m.to(vol_device) for m in msks]
-        smpl_rotvec_dev = [t.to(vol_device) for t in smpl_rotvec]
-        smpl_shape_dev = [t.to(vol_device) for t in smpl_shape]
-        smpl_transl_dev = [t.to(vol_device) for t in smpl_transl]
-        smpl_expression_dev = [
-            t.to(vol_device) if t is not None else None for t in smpl_expression
-        ]
-    else:
-        # No volumetric query — keep everything on CPU and reuse the originals for the
-        # SMPL forward call. pr_poses_dev / pts3ds_other_dev / msks_dev are unused in this branch.
-        intrinsics_dev = intrinsics_tosave
-        smpl_rotvec_dev = smpl_rotvec
-        smpl_shape_dev = smpl_shape
-        smpl_transl_dev = smpl_transl
-        smpl_expression_dev = smpl_expression
+        # Cross-chunk state.
+        self.pose_base = torch.eye(4)
+        self.any_reset_seen = False
+        self.prev_chunk_last_reset = False
+        self.frame_counter = 0
 
-    if save:
-        print(f"Saving output to {outdir}...")
-        os.makedirs(os.path.join(outdir, "depth"), exist_ok=True)
-        os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
-        os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
-        os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
-        os.makedirs(os.path.join(outdir, "smpl"), exist_ok=True)
+        # Lazily built on first chunk (need num_betas from a real prediction).
+        self.smpl_layer = None
+        self.smpl_faces = None
+        self.vol_device = None
 
-    all_verts = []
-    inside_masks = []  # per-frame [H, W] bool: scene points (non-human) inside any SMPL volume
-    for f_id in range(B):
-        n_humans_i = smpl_shape[f_id].shape[0]
-        
-        if n_humans_i > 0:
-            with torch.no_grad():
-                smpl_out = smpl_layer(
-                    smpl_rotvec_dev[f_id],
-                    smpl_shape_dev[f_id],
-                    smpl_transl_dev[f_id],
-                    None, None,
-                    K=intrinsics_dev[f_id].expand(n_humans_i, -1, -1),
-                    expression=smpl_expression_dev[f_id])
-        
-        depth = depths_tosave[f_id].numpy()
-        conf = conf_self_tosave[f_id].numpy()
-        color = colors_tosave[f_id].numpy()
-        c2w = cam2world_tosave[f_id].numpy()
-        intrins = intrinsics_tosave[f_id].numpy()
+        # Viewer payload accumulators (compressed dtypes).
+        self.viewer_pts3ds = []
+        self.viewer_colors = []
+        self.viewer_conf = []
+        self.viewer_msks = []
+        self.viewer_verts = []
+        self.viewer_smpl_id = []
+        self.viewer_inside_masks = []
+        # Per-chunk camera arrays, concatenated in finalize().
+        self.cam_focal_chunks = []
+        self.cam_pp_chunks = []
+        self.cam_R_chunks = []
+        self.cam_t_chunks = []
 
-        if n_humans_i > 0:
-            # CPU copies for downstream (numpy / viewer / geotrf with CPU pr_poses)
-            smpl_v3d_cpu = smpl_out['smpl_v3d'].cpu()
-            # transform smpl verts to world coordinates
-            all_verts.append(geotrf(pr_poses[f_id], smpl_v3d_cpu.unsqueeze(0))[0])
-            pr_verts = [t.numpy() for t in smpl_v3d_cpu.unbind(0)]
-            pr_faces = [smpl_faces] * n_humans_i
+        self.H = None
+        self.W = None
 
-            if compute_vsmpl_metric:
-                # World-space penetration query: which scene points lie inside any SMPL volume?
-                verts_world_dev = geotrf(pr_poses_dev[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0]
-                joints_world_dev = geotrf(pr_poses_dev[f_id], smpl_out['smpl_j3d'].unsqueeze(0))[0]
-                points_world_dev = pts3ds_other_dev[f_id].reshape(-1, 3)
-                # expand() gives a zero-stride view across humans. The volume's internal F.pad
-                # allocates a fresh contiguous tensor anyway, so .contiguous() here would only
-                # double-allocate without saving downstream work.
-                points_world_b = points_world_dev.unsqueeze(0).expand(n_humans_i, -1, -1)
-                smpl_volume_state = SimpleNamespace(
-                    full_pose=smpl_rotvec_dev[f_id].reshape(n_humans_i, -1),
-                    joints=joints_world_dev,
-                    vertices=verts_world_dev,
-                )
-                with torch.no_grad():
-                    smpl_layer.bm_x.volume.detach_cache()
-                    sdf = smpl_layer.bm_x.volume.query(points_world_b, smpl_volume_state)
-                inside = (sdf < 0).any(dim=0)  # [H*W] — true if any body's SDF says inside
-                human_mask = msks_dev[f_id].reshape(-1) > 0.5  # pixels labeled as human
-                scene_mask = ~human_mask
-                n_total = inside.numel()
-                n_inside_total = int(inside.sum().item())
-                n_inside_scene = int((inside & scene_mask).sum().item())
-                n_scene = int(scene_mask.sum().item())
-                print(
-                    f"[VolumetricSMPL] Frame {f_id:06d}: "
-                    f"scene-only {n_inside_scene}/{n_scene} inside, "
-                    f"all {n_inside_total}/{n_total} inside, "
-                    f"sdf min/med/max={sdf.min().item():.3f}/{sdf.median().item():.3f}/{sdf.max().item():.3f}"
-                )
-                inside_masks.append(inside.reshape(H, W).cpu())
-        else:
-            pr_verts = []
-            pr_faces = []
-            all_verts.append(torch.empty(0))
-            if compute_vsmpl_metric:
-                inside_masks.append(torch.zeros(H, W, dtype=torch.bool))
-                print(f"[VolumetricSMPL] Frame {f_id:06d}: no humans detected")
-
-        if render:
-            hm = vis_heatmap(colors_tosave[f_id], smpl_scores[f_id]).numpy()
-            img_array_np = (color * 255).astype(np.uint8)
-            smpl_rend = render_meshes(img_array_np.copy(), pr_verts, pr_faces,
-                                        {'focal': intrins[[0,1],[0,1]], 
-                                        'princpt': intrins[[0,1],[-1,-1]]},
-                                        color=[get_color(i)/255 for i in smpl_id[f_id]])
-            if has_mask:
-                msk_array_np = vis_heatmap(colors_tosave[f_id], msks[f_id][0]).numpy()
-                color_smpl = np.concatenate([
-                    img_array_np, 
-                    (msk_array_np * 255).astype(np.uint8), 
-                    (hm * 255).astype(np.uint8), 
-                    smpl_rend], 1)
-            else:
-                color_smpl = np.concatenate([
-                    img_array_np, 
-                    (hm * 255).astype(np.uint8), 
-                    smpl_rend], 1)
-        
         if save:
-            np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
-            np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
-            iio.imwrite(
-                os.path.join(outdir, "color", f"{f_id:06d}.png"),
-                (color * 255).astype(np.uint8),
-            )
-            np.savez(
-                os.path.join(outdir, "camera", f"{f_id:06d}.npz"),
-                pose=c2w,
-                intrinsics=intrins,
-            )
-            np.savez(
-                os.path.join(outdir, "smpl", f"{f_id:06d}.npz"),
-                scores=smpl_scores[f_id].numpy(),
-                msk=msks[f_id].numpy() if has_mask else None,
-                shape=smpl_shape[f_id].numpy(),
-                rotvec=smpl_rotvec[f_id].numpy(),
-                transl=smpl_transl[f_id].numpy(),
-                expression=smpl_expression[f_id].numpy() if smpl_expression[f_id] is not None else None
-            )
-
-        # Save smpl projection
+            print(f"Saving output to {outdir}...")
+            os.makedirs(os.path.join(outdir, "depth"), exist_ok=True)
+            os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
+            os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
+            os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
+            os.makedirs(os.path.join(outdir, "smpl"), exist_ok=True)
         if render:
             os.makedirs(os.path.join(outdir, "color_smpl"), exist_ok=True)
-            iio.imwrite(
-                os.path.join(outdir, "color_smpl", f"{f_id:06d}.png"),
-                color_smpl,
-            )
 
-    if render and render_video:
-        print(f"Saving smpl mesh projection to {outdir}...")
-        frames_dir = os.path.join(outdir, "color_smpl")
-        video_path = os.path.join(outdir, "output_video.mp4")
-        output_fps = 30 // subsample
-        os.system(f'/usr/bin/ffmpeg -y -framerate {output_fps} -i "{frames_dir}/%06d.png" '
+    def _ensure_smpl_layer(self, num_betas):
+        if self.smpl_layer is not None:
+            return
+        self.smpl_layer = self._SMPL_Layer(
+            type='smplx', gender='neutral', num_betas=num_betas,
+            kid=False, person_center='head',
+        )
+        self.smpl_faces = self.smpl_layer.bm_x.faces
+        if self.compute_vsmpl_metric:
+            attach_volume(self.smpl_layer.bm_x, pretrained=True, device=self.device)
+            self.vol_device = next(self.smpl_layer.bm_x.volume.parameters()).device
+            self.smpl_layer.to(self.vol_device)
+        else:
+            self.vol_device = "cpu"
+
+    def process_chunk(self, chunk_pred, chunk_views):
+        """chunk_pred: list of res_cpu dicts (one per frame).
+           chunk_views: list of stripped view dicts ({"img", "reset"})."""
+        if not chunk_pred:
+            return
+
+        t_chunk_start = time.time()
+        t_smpl_fwd = 0.0
+        t_vsmpl = 0.0
+        t_save = 0.0
+        t_render = 0.0
+        t_viewer = 0.0
+
+        # Step A — drop overlap views at chunk boundary (replaces the
+        # shifted_reset_mask trick of the old prepare_output).
+        local_reset = torch.cat([v["reset"] for v in chunk_views], 0)  # [B_in]
+        prev_last_for_next = bool(local_reset[-1].item())
+        shifted = torch.cat(
+            [torch.tensor([self.prev_chunk_last_reset]), local_reset[:-1]], dim=0
+        )
+        keep = ~shifted
+        chunk_pred = [p for p, k in zip(chunk_pred, keep.tolist()) if k]
+        chunk_views = [v for v, k in zip(chunk_views, keep.tolist()) if k]
+        reset_mask = local_reset[keep]
+        self.prev_chunk_last_reset = prev_last_for_next
+        if not chunk_pred:
+            return  # entire chunk was a single overlap-view
+
+        B = len(chunk_pred)
+
+        # Step B — extract tensors.
+        pts3ds_self_ls = [p["pts3d_in_self_view"] for p in chunk_pred]
+        pts3ds_other_ls = [p["pts3d_in_other_view"] for p in chunk_pred]
+        conf_self_ls = [p["conf_self"] for p in chunk_pred]
+        conf_other_ls = [p["conf"] for p in chunk_pred]
+        pts3ds_self = torch.cat(pts3ds_self_ls, 0)  # [B, H, W, 3]
+        if self.H is None:
+            _, self.H, self.W, _ = pts3ds_self.shape
+        H, W = self.H, self.W
+
+        # Step C — pose recovery via shared streaming helper. Mirrors the old
+        # prepare_output's two branches (raw poses if no reset seen anywhere
+        # yet, streaming matmul once any reset fires) byte-for-byte.
+        raw_poses = [
+            self._pose_encoding_to_camera(p["camera_pose"].clone()).cpu()
+            for p in chunk_pred
+        ]  # list of [1, 4, 4]
+        pr_poses, self.pose_base, self.any_reset_seen = self._streaming_pose_recovery(
+            raw_poses, reset_mask, self.pose_base, self.any_reset_seen,
+        )
+
+        # Step D — pose-transform other-view points (use_pose path).
+        if self.use_pose:
+            transformed = []
+            for pose, pself in zip(pr_poses, pts3ds_self):
+                transformed.append(self._geotrf(pose, pself.unsqueeze(0)))
+            pts3ds_other_ls = transformed
+            conf_other_ls = conf_self_ls
+
+        # Step E — focal estimation (per-frame along B; per-chunk == one-shot).
+        pp = torch.tensor(
+            [W // 2, H // 2], device=pts3ds_self.device
+        ).float().repeat(B, 1)
+        focal = self._estimate_focal_knowing_depth(
+            pts3ds_self, pp, focal_mode="weiszfeld",
+        )
+
+        # Step F — build save-time tensors (fp32).
+        depths_tosave = pts3ds_self[..., 2]                          # [B, H, W]
+        pts3ds_other_tosave = torch.cat(pts3ds_other_ls)             # [B, H, W, 3]
+        conf_self_tosave = torch.cat(conf_self_ls)                   # [B, H, W]
+        conf_other_tosave = torch.cat(conf_other_ls)                 # [B, H, W]
+        colors_tosave = torch.cat([
+            0.5 * (v["img"].permute(0, 2, 3, 1) + 1.0) for v in chunk_views
+        ])                                                           # [B, H, W, 3]
+        cam2world_tosave = torch.cat(pr_poses)                       # [B, 4, 4]
+        intrinsics_tosave = torch.eye(3).unsqueeze(0).repeat(B, 1, 1)
+        intrinsics_tosave[:, 0, 0] = focal.detach()
+        intrinsics_tosave[:, 1, 1] = focal.detach()
+        intrinsics_tosave[:, 0, 2] = pp[:, 0]
+        intrinsics_tosave[:, 1, 2] = pp[:, 1]
+
+        # Step G — SMPL params.
+        smpl_shape = [
+            p.get("smpl_shape", torch.empty(1, 0, 10))[0] for p in chunk_pred
+        ]
+        smpl_rotvec = [
+            roma.rotmat_to_rotvec(
+                p.get("smpl_rotmat", torch.empty(1, 0, 53, 3, 3))[0]
+            )
+            for p in chunk_pred
+        ]
+        smpl_transl = [
+            p.get("smpl_transl", torch.empty(1, 0, 3))[0] for p in chunk_pred
+        ]
+        smpl_expression = [
+            p.get("smpl_expression", [None])[0] for p in chunk_pred
+        ]
+        smpl_id = [p.get("smpl_id", torch.empty(1, 0))[0] for p in chunk_pred]
+
+        if self.render or self.save:
+            smpl_scores = [
+                p.get("smpl_scores", torch.zeros(1, H, W, 1))[..., 0]
+                for p in chunk_pred
+            ]
+            if self.img_res is not None:
+                smpl_scores = [self._unpad_image(s, [H, W])[0] for s in smpl_scores]
+
+        has_mask = "msk" in chunk_pred[0]
+        if has_mask:
+            msks = [p["msk"][..., 0] for p in chunk_pred]
+            if self.img_res is not None:
+                msks = [self._unpad_image(m, [H, W]) for m in msks]
+        else:
+            msks = [torch.zeros(1, H, W) for _ in range(B)]
+
+        # Step H — lazy SMPL layer construction.
+        self._ensure_smpl_layer(num_betas=smpl_shape[0].shape[-1])
+        smpl_layer = self.smpl_layer
+        smpl_faces = self.smpl_faces
+        vol_device = self.vol_device
+
+        if self.compute_vsmpl_metric:
+            intrinsics_dev = intrinsics_tosave.to(vol_device)
+            pts3ds_other_dev = pts3ds_other_tosave.to(vol_device)
+            pr_poses_dev = [p.to(vol_device) for p in pr_poses]
+            msks_dev = [m.to(vol_device) for m in msks]
+            smpl_rotvec_dev = [t.to(vol_device) for t in smpl_rotvec]
+            smpl_shape_dev = [t.to(vol_device) for t in smpl_shape]
+            smpl_transl_dev = [t.to(vol_device) for t in smpl_transl]
+            smpl_expression_dev = [
+                t.to(vol_device) if t is not None else None for t in smpl_expression
+            ]
+        else:
+            intrinsics_dev = intrinsics_tosave
+            smpl_rotvec_dev = smpl_rotvec
+            smpl_shape_dev = smpl_shape
+            smpl_transl_dev = smpl_transl
+            smpl_expression_dev = smpl_expression
+
+        # Step I — per-frame loop. Mirrors the old prepare_output body.
+        for f_id_local in range(B):
+            f_id_global = self.frame_counter + f_id_local
+            n_humans_i = smpl_shape[f_id_local].shape[0]
+
+            if n_humans_i > 0:
+                _t = time.time()
+                with torch.no_grad():
+                    smpl_out = smpl_layer(
+                        smpl_rotvec_dev[f_id_local],
+                        smpl_shape_dev[f_id_local],
+                        smpl_transl_dev[f_id_local],
+                        None, None,
+                        K=intrinsics_dev[f_id_local].expand(n_humans_i, -1, -1),
+                        expression=smpl_expression_dev[f_id_local],
+                    )
+                t_smpl_fwd += time.time() - _t
+
+            depth = depths_tosave[f_id_local].numpy()
+            conf = conf_self_tosave[f_id_local].numpy()
+            color = colors_tosave[f_id_local].numpy()
+            c2w = cam2world_tosave[f_id_local].numpy()
+            intrins = intrinsics_tosave[f_id_local].numpy()
+
+            inside_mask_np = None
+            if n_humans_i > 0:
+                smpl_v3d_cpu = smpl_out['smpl_v3d'].cpu()
+                vert_world = self._geotrf(
+                    pr_poses[f_id_local], smpl_v3d_cpu.unsqueeze(0),
+                )[0]
+                pr_verts = [t.numpy() for t in smpl_v3d_cpu.unbind(0)]
+                pr_faces = [smpl_faces] * n_humans_i
+
+                if self.compute_vsmpl_metric:
+                    _t = time.time()
+                    verts_world_dev = self._geotrf(
+                        pr_poses_dev[f_id_local], smpl_out['smpl_v3d'].unsqueeze(0),
+                    )[0]
+                    joints_world_dev = self._geotrf(
+                        pr_poses_dev[f_id_local], smpl_out['smpl_j3d'].unsqueeze(0),
+                    )[0]
+                    points_world_dev = pts3ds_other_dev[f_id_local].reshape(-1, 3)
+                    points_world_b = points_world_dev.unsqueeze(0).expand(
+                        n_humans_i, -1, -1,
+                    )
+                    smpl_volume_state = SimpleNamespace(
+                        full_pose=smpl_rotvec_dev[f_id_local].reshape(n_humans_i, -1),
+                        joints=joints_world_dev,
+                        vertices=verts_world_dev,
+                    )
+                    with torch.no_grad():
+                        smpl_layer.bm_x.volume.detach_cache()
+                        sdf = smpl_layer.bm_x.volume.query(
+                            points_world_b, smpl_volume_state,
+                        )
+                    inside = (sdf < 0).any(dim=0)
+                    human_mask = msks_dev[f_id_local].reshape(-1) > 0.5
+                    scene_mask = ~human_mask
+                    n_total = inside.numel()
+                    n_inside_total = int(inside.sum().item())
+                    n_inside_scene = int((inside & scene_mask).sum().item())
+                    n_scene = int(scene_mask.sum().item())
+                    print(
+                        f"[VolumetricSMPL] Frame {f_id_global:06d}: "
+                        f"scene-only {n_inside_scene}/{n_scene} inside, "
+                        f"all {n_inside_total}/{n_total} inside, "
+                        f"sdf min/med/max={sdf.min().item():.3f}/"
+                        f"{sdf.median().item():.3f}/{sdf.max().item():.3f}"
+                    )
+                    inside_mask_np = inside.reshape(H, W).cpu().numpy()
+                    t_vsmpl += time.time() - _t
+            else:
+                pr_verts = []
+                pr_faces = []
+                vert_world = torch.empty(0)
+                if self.compute_vsmpl_metric:
+                    inside_mask_np = np.zeros((H, W), dtype=bool)
+                    print(f"[VolumetricSMPL] Frame {f_id_global:06d}: no humans detected")
+
+            if self.render:
+                _t = time.time()
+                hm = self._vis_heatmap(
+                    colors_tosave[f_id_local], smpl_scores[f_id_local],
+                ).numpy()
+                img_array_np = (color * 255).astype(np.uint8)
+                smpl_rend = self._render_meshes(
+                    img_array_np.copy(), pr_verts, pr_faces,
+                    {'focal': intrins[[0, 1], [0, 1]],
+                     'princpt': intrins[[0, 1], [-1, -1]]},
+                    color=[self._get_color(i) / 255 for i in smpl_id[f_id_local]],
+                )
+                if has_mask:
+                    msk_array_np = self._vis_heatmap(
+                        colors_tosave[f_id_local], msks[f_id_local][0],
+                    ).numpy()
+                    color_smpl = np.concatenate([
+                        img_array_np,
+                        (msk_array_np * 255).astype(np.uint8),
+                        (hm * 255).astype(np.uint8),
+                        smpl_rend,
+                    ], 1)
+                else:
+                    color_smpl = np.concatenate([
+                        img_array_np,
+                        (hm * 255).astype(np.uint8),
+                        smpl_rend,
+                    ], 1)
+                t_render += time.time() - _t
+
+            if self.save:
+                _t = time.time()
+                np.save(
+                    os.path.join(self.outdir, "depth", f"{f_id_global:06d}.npy"),
+                    depth,
+                )
+                np.save(
+                    os.path.join(self.outdir, "conf", f"{f_id_global:06d}.npy"),
+                    conf,
+                )
+                iio.imwrite(
+                    os.path.join(self.outdir, "color", f"{f_id_global:06d}.png"),
+                    (color * 255).astype(np.uint8),
+                )
+                np.savez(
+                    os.path.join(self.outdir, "camera", f"{f_id_global:06d}.npz"),
+                    pose=c2w, intrinsics=intrins,
+                )
+                np.savez(
+                    os.path.join(self.outdir, "smpl", f"{f_id_global:06d}.npz"),
+                    scores=smpl_scores[f_id_local].numpy(),
+                    msk=msks[f_id_local].numpy() if has_mask else None,
+                    shape=smpl_shape[f_id_local].numpy(),
+                    rotvec=smpl_rotvec[f_id_local].numpy(),
+                    transl=smpl_transl[f_id_local].numpy(),
+                    expression=(
+                        smpl_expression[f_id_local].numpy()
+                        if smpl_expression[f_id_local] is not None else None
+                    ),
+                )
+                t_save += time.time() - _t
+
+            if self.render:
+                _t = time.time()
+                iio.imwrite(
+                    os.path.join(self.outdir, "color_smpl", f"{f_id_global:06d}.png"),
+                    color_smpl,
+                )
+                t_render += time.time() - _t
+
+            # Append to the viewer payload in compressed dtypes. Shapes match
+            # the old run_inference numpy outputs: pts3d/colors are
+            # [1, H, W, 3], conf/msks are [1, H, W].
+            _t = time.time()
+            self.viewer_pts3ds.append(
+                pts3ds_other_tosave[f_id_local:f_id_local + 1].numpy().astype(np.float16)
+            )
+            color_4d = colors_tosave[f_id_local:f_id_local + 1].numpy()
+            self.viewer_colors.append(
+                (color_4d.clip(0, 1) * 255 + 0.5).astype(np.uint8)
+            )
+            self.viewer_conf.append(
+                conf_other_tosave[f_id_local:f_id_local + 1].numpy().astype(np.float16)
+            )
+            self.viewer_msks.append(msks[f_id_local].numpy().astype(np.float16))
+            self.viewer_verts.append(
+                vert_world.numpy() if isinstance(vert_world, torch.Tensor) else vert_world
+            )
+            self.viewer_smpl_id.append(smpl_id[f_id_local].cpu().numpy())
+            if self.compute_vsmpl_metric and inside_mask_np is not None:
+                self.viewer_inside_masks.append(inside_mask_np)
+            t_viewer += time.time() - _t
+
+        # Per-chunk camera arrays.
+        R_c2w = torch.cat([p[:, :3, :3] for p in pr_poses], 0)
+        t_c2w = torch.cat([p[:, :3, 3] for p in pr_poses], 0)
+        self.cam_focal_chunks.append(focal.cpu().numpy())
+        self.cam_pp_chunks.append(pp.cpu().numpy())
+        self.cam_R_chunks.append(R_c2w.cpu().numpy())
+        self.cam_t_chunks.append(t_c2w.cpu().numpy())
+
+        self.frame_counter += B
+
+        t_total = time.time() - t_chunk_start
+        t_other = max(
+            0.0,
+            t_total - (t_smpl_fwd + t_vsmpl + t_save + t_render + t_viewer),
+        )
+        print(
+            f"  [proc] B={B} total={t_total:.2f}s | "
+            f"smpl_fwd={t_smpl_fwd:.2f}s vsmpl={t_vsmpl:.2f}s "
+            f"save={t_save:.2f}s render={t_render:.2f}s "
+            f"viewer_append={t_viewer:.2f}s other={t_other:.2f}s"
+        )
+
+    def finalize(self, render_video=False, subsample=1):
+        cam_dict = {
+            "focal": np.concatenate(self.cam_focal_chunks, 0)
+                if self.cam_focal_chunks else np.empty(0, dtype=np.float32),
+            "pp": np.concatenate(self.cam_pp_chunks, 0)
+                if self.cam_pp_chunks else np.empty((0, 2), dtype=np.float32),
+            "R": np.concatenate(self.cam_R_chunks, 0)
+                if self.cam_R_chunks else np.empty((0, 3, 3), dtype=np.float32),
+            "t": np.concatenate(self.cam_t_chunks, 0)
+                if self.cam_t_chunks else np.empty((0, 3), dtype=np.float32),
+        }
+        if self.render and render_video:
+            print(f"Saving smpl mesh projection to {self.outdir}...")
+            frames_dir = os.path.join(self.outdir, "color_smpl")
+            video_path = os.path.join(self.outdir, "output_video.mp4")
+            output_fps = 30 // subsample
+            os.system(
+                f'/usr/bin/ffmpeg -y -framerate {output_fps} -i "{frames_dir}/%06d.png" '
                 f'-vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" '
                 f'-vcodec h264 -preset fast -profile:v baseline -pix_fmt yuv420p '
-                f'-movflags +faststart -b:v 5000k "{video_path}"')
-    
-    return (
-        pts3ds_other,
-        colors,
-        conf_other,
-        cam_dict,
-        all_verts,
-        smpl_faces,
-        smpl_id,
-        msks,
-        inside_masks,
-    )
+                f'-movflags +faststart -b:v 5000k "{video_path}"'
+            )
+        return (
+            self.viewer_pts3ds,
+            self.viewer_colors,
+            self.viewer_conf,
+            cam_dict,
+            self.viewer_verts,
+            self.smpl_faces,
+            self.viewer_smpl_id,
+            self.viewer_msks,
+            self.viewer_inside_masks,
+        )
 
 def parse_seq_path(p):
     if os.path.isdir(p):
@@ -673,9 +755,10 @@ def run_inference(args):
     # Add the checkpoint path (required for model imports in the dust3r package).
     add_path_to_dust3r(args.model_path)
 
-    # Import model and inference functions after adding the ckpt path.
-    from src.dust3r.inference import inference_recurrent_lighter
+    # Import model after adding the ckpt path. Streaming inference drives
+    # model.forward_step directly, so we no longer need inference_recurrent_lighter.
     from src.dust3r.model import ARCroco3DStereo
+    from src.dust3r.utils.streaming import frame_iter_from_loader
     from viser_utils import SceneHumanViewer
 
     timings = {}
@@ -704,70 +787,118 @@ def run_inference(args):
     model.eval()
     timings["load_model"] = time.time() - t0
 
-    # Prepare input views.
-    print("Preparing input views...")
+    # Build streaming dataset + loader.
+    print("Building frame dataset...")
     t0 = time.time()
     img_res = getattr(model, 'mhmr_img_res', None)
-    views = prepare_input(
+    dataset = FrameDataset(
         img_paths=img_paths,
-        img_mask=img_mask,
         size=args.size,
-        revisit=1,
-        update=True,
         img_res=img_res,
-        reset_interval=args.reset_interval
+        reset_interval=args.reset_interval,
     )
-    timings["prepare_input_views"] = time.time() - t0
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        collate_fn=lambda x: x,
+    )
+    timings["build_dataset"] = time.time() - t0
 
-    if tmpdirname is not None:
-        shutil.rmtree(tmpdirname)
-
-    # Run inference.
-    print("Running inference...")
+    # Streaming inference + chunked post-processing. Each chunk is post-
+    # processed (pose recovery, SMPL forward, optional save, viewer-payload
+    # build at fp16/uint8) and dropped before the next chunk runs, so peak
+    # RAM is bounded by chunk_size rather than total frame count.
+    # no_grad + autocast(enabled=False) match the wrapping that
+    # inference_recurrent_lighter used to provide (inference.py).
+    print("Running inference + processing (streaming)...")
+    processor = ChunkProcessor(
+        outdir=args.output_dir,
+        save=args.save,
+        render=args.render,
+        render_video=args.render_video,
+        img_res=img_res,
+        subsample=args.subsample,
+        device=device,
+        compute_vsmpl_metric=args.eval_vsmpl,
+        use_pose=True,
+    )
     start_time = time.time()
-    outputs, _ = inference_recurrent_lighter(
-        views, model, device, use_ttt3r=args.use_ttt3r)
+    state_args = None
+    trackers = None
+    chunk_pred = []
+    chunk_views = []
+    n_processed = 0
+    n_chunks = 0
+    chunk_inf_time = 0.0
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+        for view in frame_iter_from_loader(loader):
+            t_inf = time.time()
+            res, state_args, trackers = model.forward_step(
+                view, device,
+                state_args=state_args, trackers=trackers,
+                use_ttt3r=args.use_ttt3r,
+            )
+            chunk_inf_time += time.time() - t_inf
+            chunk_pred.append(res)
+            chunk_views.append(_strip_view_for_output(view))
+            n_processed += 1
+            if len(chunk_pred) >= args.chunk_size:
+                t_proc = time.time()
+                processor.process_chunk(chunk_pred, chunk_views)
+                t_proc = time.time() - t_proc
+                n_chunks += 1
+                print(
+                    f"  chunk {n_chunks} ({n_processed} frames done): "
+                    f"inference={chunk_inf_time:.2f}s | processing={t_proc:.2f}s"
+                )
+                chunk_inf_time = 0.0
+                chunk_pred.clear()
+                chunk_views.clear()
+        if chunk_pred:
+            t_proc = time.time()
+            processor.process_chunk(chunk_pred, chunk_views)
+            t_proc = time.time() - t_proc
+            n_chunks += 1
+            print(
+                f"  chunk {n_chunks} (tail, {len(chunk_pred)} frames): "
+                f"inference={chunk_inf_time:.2f}s | processing={t_proc:.2f}s"
+            )
+            chunk_pred.clear()
+            chunk_views.clear()
     total_time = time.time() - start_time
-    timings["run_inference"] = total_time
-    per_frame_time = total_time / len(views)
+    timings["run_inference_and_process"] = total_time
+    per_frame_time = total_time / max(n_processed, 1)
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
 
-    # Process outputs for visualization.
-    print("Preparing output for visualization...")
-    t0 = time.time()
-    (
-        pts3ds_other, 
-        colors,
-        conf,
-        cam_dict,
-        all_smpl_verts,
-        smpl_faces,
-        smpl_id,
-        msks,
-        inside_masks,
-        ) = prepare_output(
-        outputs, args.output_dir, 1, True,
-        args.save, args.render, args.render_video, img_res, args.subsample,
-        device=device, compute_vsmpl_metric=args.eval_vsmpl,
-    )
+    if tmpdirname is not None:
+        shutil.rmtree(tmpdirname)
 
-    # Convert tensors to numpy arrays for visualization.
-    pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
-    colors_to_vis = [c.cpu().numpy() for c in colors]
-    msks_to_vis = [m.cpu().numpy() for m in msks]
-    conf_to_vis = [c.cpu().numpy() for c in conf]
+    # Collect viewer payload from the processor. Arrays are already numpy in
+    # compressed dtypes (pts3d/conf/msks: fp16; colors: uint8).
+    (pts3ds_to_vis,
+     colors_to_vis,
+     conf_to_vis,
+     cam_dict,
+     verts_to_vis,
+     smpl_faces,
+     smpl_id,
+     msks_to_vis,
+     inside_masks) = processor.finalize(
+        render_video=args.render_video, subsample=args.subsample,
+    )
     edge_colors = [None] * len(pts3ds_to_vis)
-    verts_to_vis = [p.cpu().numpy() for p in all_smpl_verts]
 
     if args.eval_vsmpl:
-        # Paint points inside an SMPL volume in red. colors_to_vis[i]: [1, H, W, 3] in [0,1].
-        red = np.array([1.0, 0.0, 0.0], dtype=colors_to_vis[0].dtype)
+        # Paint points inside an SMPL volume in red. colors_to_vis[i] is uint8
+        # [1, H, W, 3]; inside_masks[i] is numpy bool [H, W].
+        red = np.array([255, 0, 0], dtype=np.uint8)
         for i, m in enumerate(inside_masks):
-            colors_to_vis[i][0][m.cpu().numpy()] = red
-
-    timings["process_outputs"] = time.time() - t0
+            colors_to_vis[i][0][m] = red
 
     if args.save_scene:
         import pickle
@@ -780,7 +911,7 @@ def run_inference(args):
             "cam_dict": cam_dict,
             "verts": verts_to_vis,
             "smpl_faces": smpl_faces,
-            "smpl_id": [t.cpu().numpy() for t in smpl_id],
+            "smpl_id": smpl_id,  # already numpy from processor.finalize
             "msks": msks_to_vis,
             "size": args.size,
         }

@@ -148,7 +148,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     reset_interval=args.reset_interval,
                 )
                 # outputs, _ = inference(views, model, device)
-                outputs, _ = inference_recurrent_lighter(
+                outputs, _, _ = inference_recurrent_lighter(
                     views, model, device, verbose=False, use_ttt3r=args.use_ttt3r)
                 
                 (

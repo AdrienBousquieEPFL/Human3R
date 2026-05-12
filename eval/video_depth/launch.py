@@ -142,7 +142,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 )
                 start = time.time()
                 # outputs, _ = inference(views, model, device)
-                outputs, _ = inference_recurrent_lighter(
+                outputs, _, _ = inference_recurrent_lighter(
                     views, model, device, verbose=False, use_ttt3r=args.use_ttt3r)
                 end = time.time()
                 fps = len(filelist) / (end - start)
