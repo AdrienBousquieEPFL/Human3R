@@ -27,7 +27,6 @@ import tempfile
 import shutil
 from copy import deepcopy
 
-from VolumetricSMPL import attach_volume
 from types import SimpleNamespace
 
 from add_ckpt_path import add_path_to_dust3r
@@ -101,6 +100,36 @@ def parse_args():
         help="Run the VolumetricSMPL penetration metric: query each scene point against the "
              "predicted SMPL volumes and print per-frame inside counts. Also paints penetrating "
              "points red in the viewer.",
+    )
+    parser.add_argument(
+        "--opt_selfpen_begin",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run begin-only post-process optimization for SMPL-X self-intersection using VolumetricSMPL.",
+    )
+    parser.add_argument(
+        "--selfpen_begin_steps",
+        type=int,
+        default=10,
+        help="Adam steps for begin-only VolumetricSMPL self-penetration optimization.",
+    )
+    parser.add_argument(
+        "--selfpen_begin_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for begin-only VolumetricSMPL self-penetration optimization.",
+    )
+    parser.add_argument(
+        "--selfpen_opt_scope",
+        choices=("begin", "all"),
+        default="begin",
+        help="Optimize only the first valid SMPL frame, or every frame for visual before/after comparison.",
+    )
+    parser.add_argument(
+        "--compare_selfpen_begin",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlay the initial pre-optimization SMPL mesh with the post-processed mesh in the viewer.",
     )
     parser.add_argument(
         "--render",
@@ -244,17 +273,28 @@ class ChunkProcessor:
         subsample=1,
         device='cuda',
         compute_vsmpl_metric=False,
+        opt_selfpen_begin=True,
+        selfpen_begin_steps=10,
+        selfpen_begin_lr=1e-3,
+        selfpen_opt_scope="begin",
+        compare_selfpen_begin=True,
         use_pose=True,
     ):
         from src.dust3r.utils.camera import pose_encoding_to_camera
-        from src.dust3r.post_process import estimate_focal_knowing_depth
+        from src.dust3r.post_process import (
+            attach_pretrained_volume,
+            estimate_focal_knowing_depth,
+            optimize_smpl_selfpen,
+        )
         from src.dust3r.utils.geometry import geotrf
         from src.dust3r.utils import SMPL_Layer, vis_heatmap, render_meshes
         from src.dust3r.utils.image import unpad_image
         from src.dust3r.utils.streaming import streaming_pose_recovery
         from viser_utils import get_color
+        self._attach_pretrained_volume = attach_pretrained_volume
         self._pose_encoding_to_camera = pose_encoding_to_camera
         self._estimate_focal_knowing_depth = estimate_focal_knowing_depth
+        self._optimize_smpl_selfpen = optimize_smpl_selfpen
         self._geotrf = geotrf
         self._SMPL_Layer = SMPL_Layer
         self._vis_heatmap = vis_heatmap
@@ -271,6 +311,11 @@ class ChunkProcessor:
         self.subsample = subsample
         self.device = device
         self.compute_vsmpl_metric = compute_vsmpl_metric
+        self.opt_selfpen_begin = opt_selfpen_begin
+        self.selfpen_begin_steps = selfpen_begin_steps
+        self.selfpen_begin_lr = selfpen_begin_lr
+        self.selfpen_opt_scope = selfpen_opt_scope
+        self.compare_selfpen_begin = compare_selfpen_begin
         self.use_pose = use_pose
 
         # Cross-chunk state.
@@ -278,6 +323,7 @@ class ChunkProcessor:
         self.any_reset_seen = False
         self.prev_chunk_last_reset = False
         self.frame_counter = 0
+        self.selfpen_begin_done = False
 
         # Lazily built on first chunk (need num_betas from a real prediction).
         self.smpl_layer = None
@@ -290,6 +336,7 @@ class ChunkProcessor:
         self.viewer_conf = []
         self.viewer_msks = []
         self.viewer_verts = []
+        self.viewer_initial_verts = []
         self.viewer_smpl_id = []
         self.viewer_inside_masks = []
         # Per-chunk camera arrays, concatenated in finalize().
@@ -319,12 +366,41 @@ class ChunkProcessor:
             kid=False, person_center='head',
         )
         self.smpl_faces = self.smpl_layer.bm_x.faces
-        if self.compute_vsmpl_metric:
-            attach_volume(self.smpl_layer.bm_x, pretrained=True, device=self.device)
+        if self.compute_vsmpl_metric or self.opt_selfpen_begin:
+            self._attach_pretrained_volume(self.smpl_layer.bm_x, self.device)
             self.vol_device = next(self.smpl_layer.bm_x.volume.parameters()).device
             self.smpl_layer.to(self.vol_device)
         else:
             self.vol_device = "cpu"
+
+    def _should_optimize_selfpen(self):
+        if not self.opt_selfpen_begin or self.selfpen_begin_steps <= 0:
+            return False
+        return self.selfpen_opt_scope == "all" or not self.selfpen_begin_done
+
+    def _optimize_selfpen(self, pose, shape, expression, f_id_global):
+        if (
+            not self._should_optimize_selfpen()
+            or pose.shape[0] == 0
+        ):
+            return pose
+
+        if self.selfpen_opt_scope == "begin":
+            self.selfpen_begin_done = True
+        opt_pose, stats = self._optimize_smpl_selfpen(
+            self.smpl_layer.bm_x,
+            pose,
+            shape,
+            expression,
+            steps=self.selfpen_begin_steps,
+            lr=self.selfpen_begin_lr,
+        )
+        print(
+            f"[VolumetricSMPL:selfpen] Frame {f_id_global:06d}: "
+            f"{stats['initial_loss']:.6f} -> {stats['final_loss']:.6f} "
+            f"in {stats['steps']} steps on {stats['device']}"
+        )
+        return opt_pose
 
     def process_chunk(self, chunk_pred, chunk_views):
         """chunk_pred: list of res_cpu dicts (one per frame).
@@ -448,7 +524,7 @@ class ChunkProcessor:
         smpl_faces = self.smpl_faces
         vol_device = self.vol_device
 
-        if self.compute_vsmpl_metric:
+        if self.compute_vsmpl_metric or self.opt_selfpen_begin:
             intrinsics_dev = intrinsics_tosave.to(vol_device)
             pts3ds_other_dev = pts3ds_other_tosave.to(vol_device)
             pr_poses_dev = [p.to(vol_device) for p in pr_poses]
@@ -472,6 +548,33 @@ class ChunkProcessor:
             n_humans_i = smpl_shape[f_id_local].shape[0]
 
             if n_humans_i > 0:
+                initial_vert_world = None
+                should_optimize_selfpen = self._should_optimize_selfpen()
+                if self.compare_selfpen_begin and should_optimize_selfpen:
+                    _t = time.time()
+                    with torch.no_grad():
+                        initial_smpl_out = smpl_layer(
+                            smpl_rotvec_dev[f_id_local],
+                            smpl_shape_dev[f_id_local],
+                            smpl_transl_dev[f_id_local],
+                            None, None,
+                            K=intrinsics_dev[f_id_local].expand(n_humans_i, -1, -1),
+                            expression=smpl_expression_dev[f_id_local],
+                        )
+                    t_smpl_fwd += time.time() - _t
+                    initial_vert_world = self._geotrf(
+                        pr_poses[f_id_local],
+                        initial_smpl_out['smpl_v3d'].cpu().unsqueeze(0),
+                    )[0]
+
+                if should_optimize_selfpen:
+                    smpl_rotvec_dev[f_id_local] = self._optimize_selfpen(
+                        smpl_rotvec_dev[f_id_local],
+                        smpl_shape_dev[f_id_local],
+                        smpl_expression_dev[f_id_local],
+                        f_id_global,
+                    )
+                    smpl_rotvec[f_id_local] = smpl_rotvec_dev[f_id_local].cpu()
                 _t = time.time()
                 with torch.no_grad():
                     smpl_out = smpl_layer(
@@ -496,6 +599,16 @@ class ChunkProcessor:
                 vert_world = self._geotrf(
                     pr_poses[f_id_local], smpl_v3d_cpu.unsqueeze(0),
                 )[0]
+                if initial_vert_world is None:
+                    initial_vert_world = vert_world
+                elif should_optimize_selfpen:
+                    vert_delta = (vert_world - initial_vert_world).norm(dim=-1)
+                    print(
+                        f"[VolumetricSMPL:selfpen] Frame {f_id_global:06d}: "
+                        f"vertex delta mean/max="
+                        f"{vert_delta.mean().item() * 100:.3f}/"
+                        f"{vert_delta.max().item() * 100:.3f} cm"
+                    )
                 pr_verts = [t.numpy() for t in smpl_v3d_cpu.unbind(0)]
                 pr_faces = [smpl_faces] * n_humans_i
 
@@ -541,6 +654,7 @@ class ChunkProcessor:
                 pr_verts = []
                 pr_faces = []
                 vert_world = torch.empty(0)
+                initial_vert_world = torch.empty(0)
                 if self.compute_vsmpl_metric:
                     inside_mask_np = np.zeros((H, W), dtype=bool)
                     print(f"[VolumetricSMPL] Frame {f_id_global:06d}: no humans detected")
@@ -633,6 +747,11 @@ class ChunkProcessor:
             self.viewer_verts.append(
                 vert_world.numpy() if isinstance(vert_world, torch.Tensor) else vert_world
             )
+            self.viewer_initial_verts.append(
+                initial_vert_world.numpy()
+                if isinstance(initial_vert_world, torch.Tensor)
+                else initial_vert_world
+            )
             self.viewer_smpl_id.append(smpl_id[f_id_local].cpu().numpy())
             if self.compute_vsmpl_metric and inside_mask_np is not None:
                 self.viewer_inside_masks.append(inside_mask_np)
@@ -688,6 +807,7 @@ class ChunkProcessor:
             self.viewer_conf,
             cam_dict,
             self.viewer_verts,
+            self.viewer_initial_verts,
             self.smpl_faces,
             self.viewer_smpl_id,
             self.viewer_msks,
@@ -823,6 +943,11 @@ def run_inference(args):
         subsample=args.subsample,
         device=device,
         compute_vsmpl_metric=args.eval_vsmpl,
+        opt_selfpen_begin=args.opt_selfpen_begin,
+        selfpen_begin_steps=args.selfpen_begin_steps,
+        selfpen_begin_lr=args.selfpen_begin_lr,
+        selfpen_opt_scope=args.selfpen_opt_scope,
+        compare_selfpen_begin=args.compare_selfpen_begin,
         use_pose=True,
     )
     start_time = time.time()
@@ -885,6 +1010,7 @@ def run_inference(args):
      conf_to_vis,
      cam_dict,
      verts_to_vis,
+     initial_verts_to_vis,
      smpl_faces,
      smpl_id,
      msks_to_vis,
@@ -910,6 +1036,7 @@ def run_inference(args):
             "conf": conf_to_vis,
             "cam_dict": cam_dict,
             "verts": verts_to_vis,
+            "initial_verts": initial_verts_to_vis,
             "smpl_faces": smpl_faces,
             "smpl_id": smpl_id,  # already numpy from processor.finalize
             "msks": msks_to_vis,
@@ -931,9 +1058,16 @@ def run_inference(args):
         smpl_faces,
         smpl_id,
         msks_to_vis,
+        gt_smpl_verts=(
+            initial_verts_to_vis
+            if args.compare_selfpen_begin and args.opt_selfpen_begin
+            else None
+        ),
         device=device,
         edge_color_list=edge_colors,
         show_camera=True,
+        show_gt_smpl=args.compare_selfpen_begin and args.opt_selfpen_begin,
+        gt_smpl_label="Initial SMPL",
         vis_threshold=args.vis_threshold,
         msk_threshold=args.msk_threshold,
         mask_morph=args.mask_morph,

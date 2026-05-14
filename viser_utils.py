@@ -355,6 +355,8 @@ class SceneHumanViewer:
         downsample_factor=10,
         smpl_downsample_factor=1,
         camera_downsample_factor=1,
+        gt_smpl_label="GT SMPL",
+        gt_smpl_color=(100, 100, 100),
     ):
         self.size=size
         self.server = viser.ViserServer(host="0.0.0.0", port=port)
@@ -377,6 +379,8 @@ class SceneHumanViewer:
         self.cam_dict = cam_dict
         self.gt_cam_dict = gt_cam_dict
         self.gt_smpl_verts = gt_smpl_verts
+        self.gt_smpl_label = gt_smpl_label
+        self.gt_smpl_color = gt_smpl_color
         self.num_frames = len(self.all_steps)
         self.image_mask = image_mask
         self.show_camera = show_camera
@@ -643,7 +647,7 @@ class SceneHumanViewer:
         )
 
         self.show_gt_smpl_checkbox = self.server.add_gui_checkbox(
-            "Show GT SMPL", 
+            f"Show {self.gt_smpl_label}",
             initial_value=self.show_gt_smpl
         )
    
@@ -1156,7 +1160,7 @@ class SceneHumanViewer:
                 self.mesh_handles.append(mesh_handle)
                 self.mesh_step_mapping.append(step)
         
-        # Add GT SMPL mesh if enabled
+        # Add comparison SMPL mesh if enabled
         if self.show_gt_smpl:
             self.add_gt_smpl(step)
 
@@ -1253,7 +1257,7 @@ class SceneHumanViewer:
                     flat_shading=False,
                     wireframe=False,
                     opacity=mesh_opacity,
-                    color=(100, 100, 100),
+                    color=self.gt_smpl_color,
                 )
                 self.gt_mesh_handles.append(mesh_handle)
                 self.gt_mesh_step_mapping.append(step)

@@ -8,7 +8,15 @@ Run demo.py with --save_scene first to produce scene.pkl. Then:
 """
 
 import argparse
+import os
 import pickle
+import sys
+
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(REPO_DIR, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
 from viser_utils import SceneHumanViewer
 
@@ -31,6 +39,12 @@ def parse_args():
     parser.add_argument("--downsample_factor", type=int, default=1)
     parser.add_argument("--smpl_downsample", type=int, default=1)
     parser.add_argument("--camera_downsample", type=int, default=1)
+    parser.add_argument(
+        "--compare_initial_smpl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlay the saved initial pre-optimization SMPL mesh when available.",
+    )
     return parser.parse_args()
 
 
@@ -42,6 +56,7 @@ def main():
         s = pickle.load(f)
 
     edge_colors = [None] * len(s["pts3ds"])
+    initial_verts = s.get("initial_verts") if args.compare_initial_smpl else None
 
     print("Launching Human3R viewer...")
     viewer = SceneHumanViewer(
@@ -53,10 +68,13 @@ def main():
         s["smpl_faces"],
         s["smpl_id"],
         s["msks"],
+        gt_smpl_verts=initial_verts,
         device=args.device,
         port=args.port,
         edge_color_list=edge_colors,
         show_camera=True,
+        show_gt_smpl=initial_verts is not None,
+        gt_smpl_label="Initial SMPL",
         vis_threshold=args.vis_threshold,
         msk_threshold=args.msk_threshold,
         mask_morph=args.mask_morph,
