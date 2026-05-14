@@ -70,6 +70,15 @@ def get_args_parser():
         help="If set, truncate each sequence's filelist to this many frames "
              "(verification convenience; leave unset for normal runs).",
     )
+    parser.add_argument(
+        "--max_seqs", type=int, default=None,
+        help="If set, only evaluate the first N sequences "
+             "(verification convenience; leave unset for normal runs).",
+    )
+    parser.add_argument(
+        "--seq_filter", type=str, default=None,
+        help="If set, only evaluate sequences whose name contains this substring.",
+    )
     return parser
 
 def get_seq_list(metadata, img_path):
@@ -137,7 +146,7 @@ def get_pred_smpl(pred, gt, f_id, is_naive, smpl_layer, mhmr_img_res, K_to_proj)
                 K=expand(K_to_proj[f_id]), 
                 expression=pred['expression'][f_id])
     
-    return smpl_out['smpl_v3d']
+    return smpl_out
 
 def match_2d(pr_j2d, gt_j2d):
     # match pred to gt - based on 2d bbox
@@ -345,16 +354,17 @@ class EvalChunkProcessor:
             n_humans_i = pred['shape'][f_id_local].shape[0]
 
             if n_humans_i > 0:
-                pred_v3d_c = get_pred_smpl(
+                smpl_out = get_pred_smpl(
                     pred, gt, f_id_local, self.args.is_naive,
                     self.smpl_layer, self.mhmr_img_res, K_to_proj,
                 )
-                pred_v3d_c = self.smpl_model.smplx2smpl @ pred_v3d_c
+                pred_v3d_c = self.smpl_model.smplx2smpl @ smpl_out['smpl_v3d']
                 pred_j3d_c = self.smpl_model.j_regressor @ pred_v3d_c
                 pr_j2d = self._perspective_projection(
                     pred_j3d_c, K_to_proj[f_id_local].expand(n_humans_i, -1, -1),
                 )
             else:
+                smpl_out = None
                 pred_v3d_c = torch.empty(0, 6890, 3, dtype=torch.float32)
                 pr_j2d = torch.empty(0, 24, 2, dtype=torch.float32)
 
@@ -374,6 +384,15 @@ class EvalChunkProcessor:
                 camcoord_metrics = eval_camcoord(camcoord_batch, self.pelvis_idx)
                 for k, v in camcoord_metrics.items():
                     self.metrics[k].append(v)
+
+                if smpl_out is not None and hasattr(self.smpl_layer.bm_x, 'volume'):
+                    depth_mm = compute_self_penetration(
+                        self.smpl_layer.bm_x,
+                        pred['rotvec'][f_id_local],
+                        pred['shape'][f_id_local],
+                        expression=pred['expression'][f_id_local],
+                    )
+                    self.metrics['self_pen_depth'].append(np.array([depth_mm]))
 
                 if self.is_global:
                     expand = lambda x: x.expand(len(bestMatch), -1, -1)
@@ -483,6 +502,10 @@ def eval_smpl_error(args, model, smpl_model, smpl_layer, save_dir=None):
     pelvis_idx = smpl_model.pelvis_idx
 
     seq_list, seq_to_images, annots = get_seq_list(metadata, img_path)
+    if args.seq_filter is not None:
+        seq_list = [s for s in seq_list if args.seq_filter in s]
+    if args.max_seqs is not None:
+        seq_list = seq_list[:args.max_seqs]
 
     if save_dir is None:
         save_dir = args.output_dir
@@ -490,6 +513,13 @@ def eval_smpl_error(args, model, smpl_model, smpl_layer, save_dir=None):
     distributed_state = PartialState()
     model.to(distributed_state.device)
     device = distributed_state.device
+
+    try:
+        from VolumetricSMPL import attach_volume
+        attach_volume(smpl_layer.bm_x, pretrained=True, device=device)
+        print("[VolumetricSMPL] Volume attached — self-penetration metric enabled.")
+    except Exception as e:
+        print(f"[VolumetricSMPL] Skipping self-penetration metric: {e}")
 
     keep_keys = {"img", "img_mask", "true_shape", "img_mhmr", "reset", "update", "K_mhmr"}
 

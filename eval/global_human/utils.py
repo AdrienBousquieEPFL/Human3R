@@ -252,29 +252,29 @@ def extract_metrics(file_path):
         content = file.read()
 
     matches = re.findall(
-        r'n_human: (\d+).*?PVE: ([\d.]+), PA-PVE: ([\d.]+), Metric-PVE: ([\d.]+), MPJPE: ([\d.]+), PA-MPJPE: ([\d.]+), Metric-MPJPE: ([\d.]+), RootError: ([\d.]+), W-MPJPE: ([\d.]+), WA-MPJPE: ([\d.]+), RTE: ([\d.]+), Scaled-RTE: ([\d.]+), Jitter: ([\d.]+), Foot-Sliding: ([\d.]+), Precision: ([\d.]+), Recall: ([\d.]+), F1-Score: ([\d.]+)',
+        r'n_human: (\d+).*?PVE: ([\d.]+), PA-PVE: ([\d.]+), Metric-PVE: ([\d.]+), MPJPE: ([\d.]+), PA-MPJPE: ([\d.]+), Metric-MPJPE: ([\d.]+), RootError: ([\d.]+), W-MPJPE: ([\d.]+), WA-MPJPE: ([\d.]+), RTE: ([\d.]+), Scaled-RTE: ([\d.]+), Jitter: ([\d.]+), Foot-Sliding: ([\d.]+), Self-Pen-Depth: ([\d.]+), Precision: ([\d.]+), Recall: ([\d.]+), F1-Score: ([\d.]+)',
         content
     )
 
     if not matches:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
     total_humans = 0
-    weighted_sums = [0.0] * 16
-    
+    weighted_sums = [0.0] * 17
+
     for match in matches:
         n_human = int(match[0])
         metrics = [float(x) for x in match[1:]]
-        
+
         total_humans += n_human
         for i, metric in enumerate(metrics):
             weighted_sums[i] += metric * n_human
-    
+
     if total_humans == 0:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
     averages = [ws / total_humans for ws in weighted_sums]
-    
+
     return total_humans, *averages
 
 
@@ -292,15 +292,15 @@ def process_directory(directory):
 
 def calculate_averages(results):
     if not results:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
     total_humans = sum(r[0] for r in results)
     if total_humans == 0:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    
-    weighted_sums = [sum(r[i] * r[0] for r in results) for i in range(1, 17)]
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    weighted_sums = [sum(r[i] * r[0] for r in results) for i in range(1, 18)]
     averages = [ws / total_humans for ws in weighted_sums]
-    
+
     return total_humans, *averages
 
 def visualize(
@@ -383,6 +383,7 @@ def write_log(log_path, dataset, seq, counter, metrics):
             f"Scaled-RTE: {avg_per_human(metrics['rte_scaled']):.1f}, "
             f"Jitter: {avg_per_human(metrics['jitter']):.1f}, "
             f"Foot-Sliding: {avg_per_human(metrics['fs']):.1f}, "
+            f"Self-Pen-Depth: {avg_per_human(metrics.get('self_pen_depth', [])):.2f}, "
             f"Precision: {metrics['precision']:.1f}, "
             f"Recall: {metrics['recall']:.1f}, "
             f"F1-Score: {metrics['f1_score']:.1f}\n"
@@ -413,10 +414,13 @@ def get_summary_log(summary):
         f"  Jitter:      {summary[12]:6.1f}\n"
         f"  Foot-Sliding: {summary[13]:6.1f}\n"
         f"\n"
+        f"Self-Penetration Metrics (VolumetricSMPL):\n"
+        f"  Self-Pen-Depth (mm): {summary[14]:6.2f}\n"
+        f"\n"
         f"Detection Metrics (%):\n"
-        f"  Precision:   {summary[14]:6.1f}\n"
-        f"  Recall:      {summary[15]:6.1f}\n"
-        f"  F1-Score:    {summary[16]:6.1f}\n"
+        f"  Precision:   {summary[15]:6.1f}\n"
+        f"  Recall:      {summary[16]:6.1f}\n"
+        f"  F1-Score:    {summary[17]:6.1f}\n"
         f"{'='*32}\n"
     )
     
@@ -630,6 +634,42 @@ def compute_foot_sliding(target_verts, pred_verts, thr=1e-2):
     error = pred_disp[contact]
 
     return error.cpu().numpy()
+
+def compute_self_penetration(bm_x, rotvec, shape, expression=None):
+    """Self-collision loss and mean penetration depth via VolumetricSMPL.
+
+    bm_x       : smplx model with volume attached (smpl_layer.bm_x)
+    rotvec     : (N, 53, 3) Human3R rotation vectors
+    shape      : (N, num_betas) shape parameters
+    expression : (N, 10) expression parameters or None
+
+    Returns: mean_depth_mm float
+      Mean SDF penetration depth (mm) of vertices with SDF < 0. Best used as
+      a relative comparison metric — noise floor is consistent across methods.
+    """
+    n = rotvec.shape[0]
+    dev = rotvec.device
+    bm_x = bm_x.to(dev)
+
+    with torch.no_grad():
+        smpl_output = bm_x(
+            global_orient=rotvec[:, 0].reshape(n, 3),
+            body_pose=rotvec[:, 1:22].reshape(n, 63),
+            left_hand_pose=rotvec[:, 22:37].reshape(n, 45),
+            right_hand_pose=rotvec[:, 37:52].reshape(n, 45),
+            jaw_pose=rotvec[:, 52].reshape(n, 3),
+            betas=shape,
+            expression=expression if expression is not None else bm_x.expression.to(dev).repeat(n, 1),
+            leye_pose=bm_x.leye_pose.to(dev).repeat(n, 1),
+            reye_pose=bm_x.reye_pose.to(dev).repeat(n, 1),
+            return_full_pose=True,
+        )
+        sdf = bm_x.volume.query(smpl_output.vertices, smpl_output)  # (N, V)
+
+    inside = sdf < 0
+    mean_depth_mm = (-sdf[inside]).mean().item() * 1000.0 if inside.any() else 0.0
+    return mean_depth_mm
+
 
 def eval_camcoord(batch, pelvis_idxs=[1, 2], fps=30):
     """

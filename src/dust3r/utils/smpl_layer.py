@@ -77,8 +77,14 @@ class SMPL_Layer(nn.Module):
         # No humans
         if bs == 0:
             return {}
-        
-        # Low dimensional parameters        
+
+        # Ensure bm_x is on the same device as the input (volume submodules
+        # attached after construction may not get moved by an outer .to()).
+        dev = pose.device
+        if next(self.bm_x.parameters()).device != dev:
+            self.bm_x.to(dev)
+
+        # Low dimensional parameters
         kwargs_pose = {
             'betas': shape,
         }
